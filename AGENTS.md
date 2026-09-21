@@ -206,3 +206,76 @@ HTTPS 明文采集是后期研究方向。OpenSSL 的 SSL_read/SSL_write 仅是�
   agent_id=1、cgroup_id=11286、PID=41507 在注册、业务事件和退出记录中一致，
   Agent exit_code=0，整体命令退出状态 0。这验证了普通用户身份在第一条业务
   exec 事件前已生效。
+
+## 正式进程生命周期采集（2026-09-21）
+
+- 用户确认正式原型第二个里程碑使用 `sched_process_fork` 与
+  `sched_process_exit`。公共头 pid/tid 始终表示产生事件的当前任务。
+- `PROCESS_FORK` 载荷为 parent_pid、child_pid、child_comm；本机 BTF 将
+  comm 表示为 `__data_loc_child_comm`，BPF 程序按低 16 位偏移读取动态字符串。
+  `PROCESS_EXIT` 载荷为 task_struct.exit_code 的 exit_code_raw，用户态暂不擅自
+  解释为正常退出码或信号。
+- 两个探针均先用当前 cgroup_id 查询 agent_by_cgroup，未登记 cgroup 不输出。
+  用户态已按 event_type 和 size 分派三种事件。make 在严格警告设置下通过。
+  用户已 sudo 实测正式生命周期链路通过：根 PID 46706 的 Python exec 后创建
+  孩子 PID 46707，PROCESS_FORK 的父子 PID 与工作负载一致；孩子继承
+  agent_id=1、cgroup_id=11488 并 exec /usr/bin/true；孩子和根进程 exit_code_raw
+  均为 0，Agent exit_code 及整体命令退出状态均为 0。事件顺序完整，无串组迹象。
+- 验证命令为
+  `sudo ./build/monitor --agent 1 -- /usr/bin/python3 experiments/fork_exec.py`；
+  预期同组出现根 exec、fork、孩子 exec、孩子 exit、根 exit。
+
+## 真实文件路径方向（2026-09-21）
+
+- 用户决定跳过 syscall 调用路径过渡版，直接推进内核真实路径方案，并选择启用
+  BPF LSM。实机核对：内核配置 `CONFIG_BPF_LSM=y`，
+  `CONFIG_LSM="landlock,lockdown,yama,integrity,apparmor"`；当前
+  `/sys/kernel/security/lsm` 没有 bpf，GRUB 参数为 `quiet splash`，
+  `/proc/cmdline` 无 lsm 参数。
+- 用户已完成 GRUB 修改和重启。实测 `/proc/cmdline` 包含
+  `lsm=landlock,lockdown,yama,integrity,apparmor,bpf`，
+  `/sys/kernel/security/lsm` 输出
+  `lockdown,capability,landlock,yama,apparmor,bpf,ima,evm`，
+  BPF LSM 已实际启用，可以开始实现并加载验证真实路径探针。
+
+## BPF LSM 文件事件实现（2026-09-21）
+
+- 已按用户确认的纯 LSM 方案增加 FILE_OPEN 与 FILE_UNLINK_ATTEMPT。
+  FILE_OPEN 使用 file->f_path 调用 bpf_d_path，载荷为 path、f_flags、path_ret；
+  FILE_UNLINK_ATTEMPT 对 path_unlink 提供的可信父目录 path 调用 bpf_d_path，
+  并读取目标 dentry 名称，由用户态组合完整路径；载荷为 dir_path、name、
+  path_ret、name_ret。
+- 两个程序只处理 agent_by_cgroup 已登记的 cgroup，并原样返回已有 LSM ret，
+  不实施访问控制。unlink 事件明确是删除前尝试，不能单独证明删除成功。
+  不存在路径通常不会到达 file_open/path_unlink，因此纯 LSM 版本不会产生失败事件。
+- 共享协议与用户态分派已扩展，make 严格编译通过；尚未 sudo 加载验证。
+  验证使用 experiments/file_activity.py，重点核对 sample.txt 的工作负载绝对路径、
+  LSM path、path_ret、agent_id 和 cgroup_id。
+- 首次 sudo 加载时 handle_path_unlink 被 verifier 以 -13 拒绝：栈上合成的
+  struct path 不是 bpf_d_path 要求的 trusted pointer。未产生运行事件。
+  已改为直接对 LSM 提供的可信父目录 path 调用 bpf_d_path，并从可信 dentry
+  读取名称；用户态将 dir_path/name 拼为完整目标路径。共享载荷新增 name_ret。
+  修复后 make 严格编译通过，待重新 sudo 加载验证。
+
+- 修复后用户 sudo 实测 BPF LSM 文件路径通过：PID 6315、agent_id=1、
+  cgroup_id=6788；sample.txt 两次 FILE_OPEN 的完整绝对路径与工作负载一致，
+  path_ret=35；FILE_UNLINK_ATTEMPT 完整路径一致，父目录 path_ret=24、
+  name_ret=11。缺失 open/unlink 没有 LSM 事件，符合纯 LSM 语义。
+  PROCESS_EXIT、Agent exit_code 和整体命令退出状态均为 0。
+- 实测同时发现启动边界噪声：子进程被迁入已登记 cgroup 后才执行 initgroups，
+  因而 /proc/sys/kernel/ngroups_max、/etc/group 及 NSS 库等降权准备访问以
+  uid=0、comm=monitor 被归入 Agent。业务路径本身正确；需要共同决定是否采用
+  两阶段门控，在迁移/登记前完成 initgroups，再迁移并执行 setresgid/setresuid/exec。
+- 用户选择两阶段门控消除降权准备噪声。实现已改为两条 pipe：子进程先在原
+  cgroup 中执行 initgroups，成功后向父进程发送 ready；父进程收到 ready 后才
+  迁移并核验 Agent cgroup、输出 register 并放行；子进程随后执行
+  setresgid/setresuid、更新环境并 exec。initgroups 失败会通知父进程并以 126
+  退出。make 严格编译通过，待复跑文件工作负载，重点确认不再出现
+  uid=0/comm=monitor 的 FILE_OPEN。
+
+- 两阶段门控已由用户复测通过：PID 7465、agent_id=1、cgroup_id=6902，
+  全部采集事件均为 uid=1000，不再出现 uid=0/comm=monitor 的 initgroups 文件访问。
+  exec 入口及动态加载器早期事件仍可能 comm=monitor，但 uid 已降为 1000，这是
+  exec 映像替换时序，不是 root 准备噪声。sample.txt 的两次 FILE_OPEN 与一次
+  FILE_UNLINK_ATTEMPT 路径保持正确，path_ret/name_ret 为正，PROCESS_EXIT、
+  Agent exit_code 和整体命令退出状态均为 0。两阶段门控问题已解决。

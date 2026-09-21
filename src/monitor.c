@@ -30,25 +30,90 @@ struct run_identity {
 
 static void on_signal(int sig) { (void)sig; stop = 1; }
 
+static void print_header(const struct monitor_event_header *h,
+                         const char *event_name)
+{
+    printf("timestamp_ns=%" PRIu64 " cgroup_id=%" PRIu64
+           " event=%s pid=%u tid=%u ppid=%u uid=%u agent_id=%u comm=%.*s",
+           (uint64_t)h->timestamp_ns, (uint64_t)h->cgroup_id, event_name,
+           h->pid, h->tid, h->ppid, h->uid, h->agent_id,
+           EVENT_COMM_LEN, h->comm);
+}
+
 static int on_event(void *ctx, void *data, size_t size)
 {
-    const struct exec_event *e = data;
     const struct monitor_event_header *h = data;
-    (void)ctx;
 
-    if (size != sizeof(*e) || h->size != size ||
-        h->event_type != EVENT_EXEC_ATTEMPT) {
-        fprintf(stderr, "discarding malformed event: type=%u size=%zu\n",
-                h->event_type, size);
+    (void)ctx;
+    if (size < sizeof(*h) || h->size != size) {
+        fprintf(stderr, "discarding malformed event: size=%zu\n", size);
         return 0;
     }
-    printf("timestamp_ns=%" PRIu64 " cgroup_id=%" PRIu64
-           " event=EXEC_ATTEMPT pid=%u tid=%u ppid=%u uid=%u agent_id=%u"
-           " comm=%.*s filename=%.*s\n",
-           (uint64_t)h->timestamp_ns, (uint64_t)h->cgroup_id, h->pid, h->tid, h->ppid, h->uid,
-           h->agent_id, EVENT_COMM_LEN, h->comm, EVENT_FILENAME_LEN,
-           e->payload.filename);
-    fflush(stdout);
+
+    switch (h->event_type) {
+    case EVENT_EXEC_ATTEMPT: {
+        const struct exec_event *event = data;
+        if (size != sizeof(*event))
+            break;
+        print_header(h, "EXEC_ATTEMPT");
+        printf(" filename=%.*s\n", EVENT_FILENAME_LEN,
+               event->payload.filename);
+        fflush(stdout);
+        return 0;
+    }
+    case EVENT_PROCESS_FORK: {
+        const struct process_fork_event *event = data;
+        if (size != sizeof(*event))
+            break;
+        print_header(h, "PROCESS_FORK");
+        printf(" parent_pid=%u child_pid=%u child_comm=%.*s\n",
+               event->payload.parent_pid, event->payload.child_pid,
+               EVENT_COMM_LEN, event->payload.child_comm);
+        fflush(stdout);
+        return 0;
+    }
+    case EVENT_PROCESS_EXIT: {
+        const struct process_exit_event *event = data;
+        if (size != sizeof(*event))
+            break;
+        print_header(h, "PROCESS_EXIT");
+        printf(" exit_code_raw=%d\n", event->payload.exit_code_raw);
+        fflush(stdout);
+        return 0;
+    }
+    case EVENT_FILE_OPEN: {
+        const struct file_open_event *event = data;
+        if (size != sizeof(*event))
+            break;
+        print_header(h, "FILE_OPEN");
+        printf(" path=%.*s flags=%u path_ret=%d\n",
+               EVENT_FILENAME_LEN, event->payload.path,
+               event->payload.flags, event->payload.path_ret);
+        fflush(stdout);
+        return 0;
+    }
+    case EVENT_FILE_UNLINK_ATTEMPT: {
+        const struct file_unlink_event *event = data;
+        if (size != sizeof(*event))
+            break;
+        size_t dir_len;
+
+        print_header(h, "FILE_UNLINK_ATTEMPT");
+        dir_len = strnlen(event->payload.dir_path, EVENT_FILENAME_LEN);
+        printf(" path=%.*s%s%.*s path_ret=%d name_ret=%d\n",
+               EVENT_FILENAME_LEN, event->payload.dir_path,
+               dir_len && event->payload.dir_path[dir_len - 1] == '/' ? "" : "/",
+               EVENT_FILENAME_LEN, event->payload.name,
+               event->payload.path_ret, event->payload.name_ret);
+        fflush(stdout);
+        return 0;
+    }
+    default:
+        break;
+    }
+
+    fprintf(stderr, "discarding unsupported event: type=%u size=%zu\n",
+            h->event_type, size);
     return 0;
 }
 
@@ -177,20 +242,37 @@ static int move_and_verify(const char *path, pid_t pid)
     return -1;
 }
 
-/* 子进程等待父进程完成 cgroup 迁移和映射注册后才执行命令。 */
-static void gated_exec(int fd, char **command,
-                       const struct run_identity *identity)
+/*
+ * 第一阶段在原 cgroup 中完成可能访问 NSS/组文件的 initgroups；
+ * 第二阶段等待父进程迁移并登记 cgroup 后，再放弃 root 并 exec。
+ */
+static void prepared_gated_exec(int gate_fd, int ready_fd, char **command,
+                                const struct run_identity *identity)
 {
     char token;
     ssize_t n;
-    do { n = read(fd, &token, 1); } while (n < 0 && errno == EINTR);
-    close(fd);
+
+    if (initgroups(identity->user, identity->gid)) {
+        perror("prepare Agent supplementary groups");
+        n = write(ready_fd, "e", 1);
+        (void)n;
+        close(ready_fd);
+        _exit(126);
+    }
+    if (write(ready_fd, "r", 1) != 1) {
+        perror("notify Agent preparation");
+        close(ready_fd);
+        _exit(126);
+    }
+    close(ready_fd);
+
+    do { n = read(gate_fd, &token, 1); } while (n < 0 && errno == EINTR);
+    close(gate_fd);
     if (n != 1 || token != 'x')
         _exit(125);
 
-    /* 先设置附加组，再彻底放弃 root 的组、有效及保存用户身份。 */
-    if (initgroups(identity->user, identity->gid) ||
-        setresgid(identity->gid, identity->gid, identity->gid) ||
+    /* 进入 Agent cgroup 后，彻底放弃 root 的组、有效及保存用户身份。 */
+    if (setresgid(identity->gid, identity->gid, identity->gid) ||
         setresuid(identity->uid, identity->uid, identity->uid)) {
         perror("drop Agent privileges");
         _exit(126);
@@ -216,7 +298,8 @@ int main(int argc, char **argv)
     __u32 agent_id;
     __u64 cg_id = 0;
     pid_t child = -1;
-    int gate[2] = {-1, -1}, status = 0, map_fd = -1, err = 0, result = 1;
+    int gate[2] = {-1, -1}, ready[2] = {-1, -1};
+    int status = 0, map_fd = -1, err = 0, result = 1;
     int made_base = 0, made_cgroup = 0, registered = 0, reaped = 0;
 
     if (argc < 5 || strcmp(argv[1], "--agent") ||
@@ -257,16 +340,34 @@ int main(int argc, char **argv)
     }
     registered = 1;
 
-    if (pipe2(gate, O_CLOEXEC) || (child = fork()) < 0) {
-        perror("create gated child");
+    if (pipe2(gate, O_CLOEXEC) || pipe2(ready, O_CLOEXEC) ||
+        (child = fork()) < 0) {
+        perror("create prepared gated child");
         goto cleanup;
     }
     if (!child) {
         close(gate[1]);
-        gated_exec(gate[0], &argv[4], &identity);
+        close(ready[0]);
+        prepared_gated_exec(gate[0], ready[1], &argv[4], &identity);
     }
+
     close(gate[0]);
     gate[0] = -1;
+    close(ready[1]);
+    ready[1] = -1;
+
+    {
+        char prepared;
+        ssize_t n;
+
+        do { n = read(ready[0], &prepared, 1); } while (n < 0 && errno == EINTR);
+        close(ready[0]);
+        ready[0] = -1;
+        if (n != 1 || prepared != 'r') {
+            fprintf(stderr, "Agent identity preparation failed\n");
+            goto cleanup;
+        }
+    }
 
     if (move_and_verify(cg_path, child))
         goto cleanup;
@@ -319,6 +420,8 @@ int main(int argc, char **argv)
 cleanup:
     if (gate[0] >= 0) close(gate[0]);
     if (gate[1] >= 0) close(gate[1]);
+    if (ready[0] >= 0) close(ready[0]);
+    if (ready[1] >= 0) close(ready[1]);
     if (child > 0 && !reaped) {
         kill(child, SIGKILL);
         while (waitpid(child, &status, 0) < 0 && errno == EINTR) {}
