@@ -1,6 +1,6 @@
 # 项目长期上下文
 
-更新时间：2026-09-16
+更新时间：2026-09-21
 
 ## 项目与资料
 
@@ -21,7 +21,10 @@
 
 ## 当前状态
 
-项目处于小步实验与设计阶段，总体设计尚未定稿，尚无正式采集器、检测器或构建系统。
+项目仍采用小步设计与验证，但已形成可构建、可运行的 libbpf CO-RE 正式原型：
+单监控器可受控启动最多 16 个 Agent，以 cgroup 归属事件，采集进程、真实文件路径、
+网络连接和失败 openat，并在独立用户态 detector 中实现三类安全规则与重复失败活动规则。
+总体设计、真实 Agent 接入、资源/逻辑异常联合判断和性能评测仍未完成。
 
 已验证（依据用户提供的输出，详见 experiments/README.md）：
 
@@ -42,7 +45,7 @@
 - 实验⑤c：超工作区删除规则原型在受控场景通过；启动器 PID 21413、Agent 1 PID/TID 21414。workspace/allowed.txt 删除成功且 outside_workspace=0、未告警；outside/victim.txt 删除成功且 outside_workspace=1，输出一条 high/success 告警；孩子和监控命令退出状态均为 0。
 - 实验⑥a：重复失败文件打开规则原型在受控场景通过；PID/TID 22858、agent_id=1，同一路径 5 次 openat 均 ret=-2，count 从 1 到 5，第 5 次 elapsed_ns=1250703（约 1.25 ms，小于 2 s），只输出一条 medium 告警，命令退出状态 0。
 
-unlinkat、rename、更多实例与压力测试、多线程归属、通用真实路径解析、其他网络场景、实验⑤正式用户态检测器、实验⑥、真实 Agent、libbpf CO-RE 原型及性能评测均未验证。环境计划中的工具链安装与 feature probe 记录仍按用户原始环境资料理解，不推断为本次重新验证。
+尚未覆盖 unlinkat、rename、openat2、更多实例与压力测试、根进程退出后的后代管理、真实 Agent、资源/逻辑异常的多维联合判断及性能评测。失败 openat 使用明确标注的还原尝试路径，不宣称为真实规范路径。环境计划中的工具链安装与 feature probe 记录仍按用户原始环境资料理解，不推断为本次重新验证。
 
 不要将建议架构、候选技术和实施顺序当作已定稿设计，也不要把受控脚本实验等同于完整满足赛题基础要求。
 
@@ -160,7 +163,7 @@ HTTPS 明文采集是后期研究方向。OpenSSL 的 SSL_read/SSL_write 仅是�
 - 随文档增长，将详细设计、实验过程和历史记录放入独立文档，在本文件保留摘要与入口。
 - 开始任务时先依据本文件恢复背景，再阅读相关源码或原始文档；不要假设已有未记录的实现和决策。
 - 区分赛题要求、用户环境记录、设计建议、实测结果。信息冲突时以赛题原文判断赛题要求，以实际检查结果更新环境状态。
-- 尚未建立构建与测试命令，不要编造命令或通过结果。新增实现时记录可复现的构建、运行和验证方法。
+- 已建立 Makefile 构建流程；仍不得编造未实际执行的命令或通过结果。新增实现时记录可复现的构建、运行和验证方法。
 - 完成重要阶段、确定技术方案或发现环境变化后，更新本文件的状态、决策、验证结果和下一步，保持简洁；详细实验过程放入单独文档。
 - 保留 `problem.md` 作为赛题依据，不将实现假设混入赛题原文。
 
@@ -279,3 +282,165 @@ HTTPS 明文采集是后期研究方向。OpenSSL 的 SSL_read/SSL_write 仅是�
   exec 映像替换时序，不是 root 准备噪声。sample.txt 的两次 FILE_OPEN 与一次
   FILE_UNLINK_ATTEMPT 路径保持正确，path_ret/name_ret 为正，PROCESS_EXIT、
   Agent exit_code 和整体命令退出状态均为 0。两阶段门控问题已解决。
+
+## 正式网络连接采集（2026-09-21）
+
+- 用户确认使用 connect syscall 入口/返回配对方案。已新增 CONNECT_RESULT，
+  载荷为 socket_fd、ret、family、destination_port（主机字节序）和
+  destination_address[16]；支持 AF_INET/AF_INET6。
+- BPF 入口仅处理已登记 cgroup，按完整 pid_tgid 将参数和 agent_id/cgroup_id
+  保存到 pending_connects hash；返回点复制后立即删除暂存项，再写 Ring Buffer。
+  用户态使用 inet_ntop 输出 dst_ip。make 严格编译通过，尚未 sudo 验证。
+- 第一项验证使用 experiments/network_connect.py。用户已 sudo 实测 IPv4
+  成功连接通过：PID 6325、socket fd 4、目标 127.0.0.1:56929 与工作负载一致，
+  ret=0，agent_id=1、cgroup_id=9530，PROCESS_EXIT 与 Agent exit_code 均为 0。
+  本轮未提供单独 echo $? 输出，不推断整体监控命令状态。下一步验证失败连接，
+  之后再验证 IPv6。
+- 用户已 sudo 实测 IPv4 失败连接通过：PID 6627、socket fd 3、目标
+  127.0.0.1:37581 与工作负载一致，Python errno=111 对应内核 ret=-111；
+  agent_id=1、cgroup_id=9600，PROCESS_EXIT、Agent exit_code 和整体命令状态均为 0。
+- 已新增 experiments/network_connect_ipv6.py，用 IPv6 回环 ::1 和动态端口验证
+  family=10、16 字节地址格式化与 ret=0；不访问外部网络。脚本先无 sudo
+  单独运行通过；随后用户 sudo 正式监控实测通过：PID 7481、socket fd 4、
+  family=10、目标 ::1:50777 与工作负载一致，ret=0，agent_id=1、
+  cgroup_id=9714，PROCESS_EXIT、Agent exit_code 和整体命令状态均为 0。
+  正式网络采集目前已验证 IPv4 成功、IPv4 ECONNREFUSED 和 IPv6 成功。
+
+## 正式多 Agent 控制面（2026-09-21）
+
+- 用户选择单监控器共享一套 BPF/Ring Buffer，同时管理多 Agent 的方案。
+  CLI 确认为
+  `--agent ID -- COMMAND [ARG...] --next --agent ID -- COMMAND [ARG...]`；
+  保留原单 Agent 格式，`--next` 是命令参数中的保留分隔符。
+- 用户态已重构为最多 16 项的 agent_process 表。Agent ID 必须唯一；每项有独立
+  cgroup、cgroup_id 映射、双 pipe 身份准备/放行门控、PID、退出状态和清理状态。
+  所有 Agent 完成 initgroups、迁移和登记后才统一放行，共享事件消费循环等待全部
+  根进程退出；全部成功返回 0，否则按输入顺序返回第一个非零状态。Ctrl-C 向所有
+  未退出根进程发送 SIGTERM。
+- make 严格编译通过；无 root 参数解析确认两个不同 ID 能进入权限检查，重复 ID
+  会在加载前拒绝并返回 2。用户已 sudo 实测两个 `sleep 1` 的最小并发场景：
+  Agent 1 为 cgroup 9916/PID 11850，Agent 2 为 cgroup 9935/PID 11851；两组
+  EXEC_ATTEMPT、动态加载 FILE_OPEN、PROCESS_EXIT 交错但归属稳定，无串组。
+  两个退出时间戳只相差 29 ns，生命周期重叠；两组 exit_code 和整体命令状态均为 0。
+  这是两组受控短任务验证，不是更多实例或压力测试。
+- 当前仍只直接管理根 PID；根进程退出后仍存活的后代和按 cgroup 整体终止/等待
+  尚未实现，不能把本次上限或根进程测试当作压力与完整后代管理结论。
+- 用户已 sudo 实测双 Agent 混合行为通过：Agent 1 为 cgroup 10005/PID 12320，
+  sample.txt 的 FILE_OPEN/FILE_UNLINK_ATTEMPT 均保持 Agent 1 归属；Agent 2 为
+  cgroup 10024/PID 12321，CONNECT_RESULT 目标 127.0.0.1:52379、fd 4、ret=0
+  且只属于 Agent 2。两组 Python 启动事件高度交错，Agent 2 先退出后 Agent 1
+  继续运行，归属仍稳定；两组 exit_code 和整体命令状态均为 0。该结果验证两种
+  事件类型的双组受控并发，不是压力测试或真实 Agent 验证。
+
+
+## 正式用户态异常检测模块（2026-09-21）
+
+- 用户确认采集与检测分离，新增 `include/detector.h` 和 `src/detector.c`。
+  Ring Buffer 回调继续校验并输出原始事件，随后把已解析事件交给 detector；
+  detector 按 agent_id 保存和查询各 Agent 策略。当前只是小型固定规则模块，
+  未引入通用配置文件或规则引擎。
+- 第一条正式规则为 `unexpected_shell`。CLI 采用每 Agent 策略格式
+  `--agent ID [--deny-shell] -- COMMAND`，因此同一监控器中的 Agent 可分别启用。
+  检测器对 EXEC_ATTEMPT 的可执行文件 basename 精确匹配 sh、bash、dash、zsh、
+  ksh、fish，命中时输出 high 告警以及 timestamp、PID/TID、agent_id、cgroup_id、
+  target、policy 和 `exec_attempt,cgroup_attribution` 证据。该规则只表示执行
+  尝试，不宣称 exec 成功。
+- make 在 `-Wall -Wextra -Werror` 下通过；参数解析确认单个
+  `--deny-shell` 可进入权限检查，重复参数会返回用法错误。本地构造事件确认
+  Agent 1 启用策略时 `/bin/sh` 产生一条告警，Agent 2 未启用策略及
+  `/usr/bin/ssh` 均不告警。
+- 用户已 sudo 完成正式双 Agent 端到端验证：Agent 1 为 cgroup 10402、根 PID
+  15588，启用 deny-shell；孩子 PID/TID 15590 的 EXEC_ATTEMPT target=/bin/sh
+  产生唯一一条 unexpected_shell 告警，二者 timestamp=3189507899723、
+  agent_id=1、cgroup_id=10402 完全对应。未启用策略的 Agent 2 为 cgroup
+  10421/PID 15589，执行 /usr/bin/true 时无规则告警。两组 exit_code 与监控器
+  整体状态均为 0。该结果验证规则的按 Agent 隔离和正例，尚不是 Shell 名单全覆盖、
+  exec 结果确认或高并发压力验证。
+
+
+## 正式敏感目录读取规则（2026-09-21）
+
+- 用户确认敏感路径采用目录范围策略，并统一规范化为带结尾 `/` 的绝对路径
+  前缀；命令行格式为每 Agent 一个 `--sensitive-path DIR`。匹配目录自身及
+  子路径，同时通过边界判断避免把相似前缀目录误认为范围内路径。相对路径、
+  重复参数和超长路径会拒绝启动。
+- detector 已新增 `sensitive_file_access`：仅 FILE_OPEN 的访问模式为
+  O_RDONLY/O_RDWR 等可读方式时匹配，O_WRONLY 和 O_DIRECTORY 不告警；输出
+  high、target、flags、agent_id/cgroup_id、policy=sensitive_read_denied 和
+  `file_open,path_policy,cgroup_attribution`。它证明打开事件到达 LSM 钩子，
+  不单独证明应用实际 read 或最终读取成功。
+- 新增 `experiments/formal_sensitive_file_access.py`，只在专用
+  `/tmp/ebpf-agent-monitor-sensitive/secret.txt` 创建、只读读取并清理无害
+  夹具。本地工作负载退出 0；make 严格编译通过；构造事件验证目录本身/子文件
+  命中、相似前缀不命中、只写/目录打开不命中、未配置 Agent 不命中。
+- 用户已 sudo 完成正式端到端验证：Agent 1 为 cgroup 10535、PID/TID 18939；
+  创建夹具的 FILE_OPEN flags=33345 无告警，只读 FILE_OPEN flags=32768 与唯一
+  一条 sensitive_file_access 告警共享 timestamp=4120192636297，且 PID/TID、
+  agent_id=1、cgroup_id=10535 和完整目标路径完全对应。清理 unlink 未触发该
+  规则，Agent 和整体命令状态均为 0。该结果验证正例与同一工作负载中的只写
+  反例，规则仍不证明应用实际 read 的结果。
+
+
+## 正式工作区外删除尝试规则（2026-09-21）
+
+- 用户选择基于现有 FILE_UNLINK_ATTEMPT 检测工作区外删除尝试，不新增 syscall
+  返回值关联，也不实施访问阻止。每 Agent CLI 为 `--workspace DIR`，目录按
+  绝对路径及结尾斜杠规范化。
+- detector 将 LSM 事件中的可信父目录路径和 dentry 名称还原为目标路径；工作区
+  内不告警，工作区外输出 high、rule=outside_workspace_delete、target、
+  agent_id/cgroup_id、policy=workspace_delete_only 和
+  `unlink_attempt,path_policy,cgroup_attribution`。路径或名称解析失败时不
+  猜测。该事件只证明删除尝试，不证明最终删除成功。
+- make 严格编译通过；构造事件验证工作区内部不命中、外部和相似前缀目录命中、
+  解析失败及未配置 Agent 不命中。新增不 fork 的
+  `experiments/formal_outside_workspace_delete.py` 作为正式验证负载，避免旧
+  bpftrace 实验中的 launcher/Agent 根进程术语与正式受控启动语义混淆。该负载
+  已单独运行、清理并退出 0。
+- 用户已 sudo 完成正式端到端验证：Agent 1 为 cgroup 10649、PID/TID 22584；
+  工作区内 allowed.txt 的 FILE_UNLINK_ATTEMPT 无告警，工作区外 victim.txt 的
+  FILE_UNLINK_ATTEMPT 与唯一一条 outside_workspace_delete 告警共享
+  timestamp=4576044265090，且 PID/TID、agent_id=1、cgroup_id=10649 和完整路径
+  完全对应。工作负载确认两次删除完成，Agent 与整体命令状态均为 0；规则本身
+  仍只证明 LSM 钩子处的删除尝试。
+
+
+## 正式重复失败打开规则（2026-09-21）
+
+- 用户确认新增失败 openat 采集，并明确失败目标不存在时不能称为真实路径。
+  eBPF 使用 sys_enter_openat/sys_exit_openat 按完整 pid_tgid 配对，入口保存
+  原始用户路径、dirfd、agent_id/cgroup_id，返回点先删除暂存项，只为负返回值
+  输出 FILE_OPEN_RESULT。成功打开继续使用 BPF LSM FILE_OPEN 的真实路径。
+  第一版未覆盖 openat2。
+- 用户确认每 Agent 用
+  `--failed-open-threshold N --failed-open-window-ms MS` 成对启用规则；缺一、
+  重复、为零或超出 u32 会在加载前拒绝。计数键为
+  `agent_id + reconstructed_path`，不是 Agent 汇总或 PID 级；detector 使用
+  128 项有界状态表，满时复用最久未活动项。
+- 路径还原支持绝对路径、AT_FDCWD 对应的 /proc/PID/cwd、普通 dirfd 对应的
+  /proc/PID/fd/DIRFD，并词法消解点号分量。日志标记
+  path_basis=reconstructed_attempt 及 reconstruction 来源，不宣称真实路径。
+  /proc 读取存在 cwd/fd 变化或进程退出的时序竞争；失败时原始事件仍输出但不计数。
+- detector 只累计 -ENOENT；每次输出 activity_evidence，首次达到阈值输出一条
+  medium repeated_failed_open 告警，同一窗口不重复告警。make 严格构建通过；
+  本地构造事件验证 absolute/proc_cwd/proc_dirfd 三种来源均能规范化、按同目标
+  累计并在阈值 2 告警；单独一个阈值参数会返回用法错误。现有
+  experiments/repeated_failed_open.py 使用绝对缺失路径，可用于首次正式验证。
+- 用户已 sudo 完成正式端到端验证：Agent 1 为 cgroup 11027、PID/TID 29930；
+  /tmp/ebpf-exp6-repeat/missing.txt 五次 FILE_OPEN_RESULT 均为 dirfd=-100、
+  ret=-2，count 1→5，第 5 次 elapsed_ns=304268 时产生唯一一条 medium 告警，
+  path_basis=reconstructed_attempt、reconstruction=absolute。Python 启动阶段
+  的多个缺失配置文件各自 count=1，未与目标路径合并。Agent 和整体命令状态均
+  为 0。用户粘贴的告警中 absolute/evidence 视觉上相连；复查源码与 build/monitor
+  字符串均存在分隔空格，不作为代码缺陷记录。
+
+
+## 2026-09-21 阶段收口与下一接续点
+
+- 本阶段正式原型已覆盖：最多 16 个受控 Agent、cgroup 唯一归属、普通用户降权、
+  exec/fork/exit、BPF LSM 真实文件打开与删除尝试、IPv4/IPv6 connect 结果、
+  失败 openat 尝试，以及独立 detector 中的 unexpected_shell、
+  sensitive_file_access、outside_workspace_delete、repeated_failed_open。
+  上述主链路均已有用户 sudo 实测记录；受控脚本结果不等同真实 Agent 或压力验证。
+- 阶段提交前重新运行 make、全部 experiments Python 语法检查和 git diff --check，
+  均通过。下一步已由用户确定：加入 cgroup CPU 使用增量，并与重复活动证据联合，
+  形成资源/逻辑异常判断；开始前仍按共同设计模式确认采样周期、阈值及告警语义。

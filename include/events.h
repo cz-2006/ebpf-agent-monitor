@@ -15,6 +15,8 @@ enum event_type {
     EVENT_PROCESS_EXIT = 3, /* 当前任务正在退出。 */
     EVENT_FILE_OPEN = 4, /* 已到达 file_open LSM 钩子。 */
     EVENT_FILE_UNLINK_ATTEMPT = 5, /* 删除前的 path_unlink LSM 钩子。 */
+    EVENT_CONNECT_RESULT = 6, /* connect 系统调用返回结果。 */
+    EVENT_FILE_OPEN_RESULT = 7, /* 当前只提交失败的 openat 返回结果。 */
 };
 
 /* 所有事件都以公共头开始，用户态据此校验长度并按类型分派。 */
@@ -71,6 +73,17 @@ struct file_open_event {
     struct file_open_payload payload;
 };
 
+struct file_open_result_payload {
+    __s32 dirfd;
+    __s32 ret; /* 负数是内核 errno；当前事件只包含失败结果。 */
+    char attempted_path[EVENT_FILENAME_LEN]; /* openat 的原始用户态路径。 */
+};
+
+struct file_open_result_event {
+    struct monitor_event_header header;
+    struct file_open_result_payload payload;
+};
+
 struct file_unlink_payload {
     __s32 path_ret; /* 父目录 bpf_d_path 返回值。 */
     __s32 name_ret; /* dentry 名称读取返回值。 */
@@ -81,6 +94,19 @@ struct file_unlink_payload {
 struct file_unlink_event {
     struct monitor_event_header header;
     struct file_unlink_payload payload;
+};
+
+struct connect_payload {
+    __s32 socket_fd;
+    __s32 ret; /* 0 表示同步成功，负数是内核 errno。 */
+    __u16 family;
+    __u16 destination_port; /* 主机字节序。 */
+    __u8 destination_address[16];
+};
+
+struct connect_event {
+    struct monitor_event_header header;
+    struct connect_payload payload;
 };
 
 #endif

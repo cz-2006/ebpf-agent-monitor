@@ -1,6 +1,7 @@
 #define _GNU_SOURCE
 #include <bpf/bpf.h>
 #include <bpf/libbpf.h>
+#include <arpa/inet.h>
 #include <errno.h>
 #include <fcntl.h>
 #include <inttypes.h>
@@ -15,10 +16,12 @@
 #include <sys/stat.h>
 #include <sys/wait.h>
 #include <unistd.h>
+#include "detector.h"
 #include "events.h"
 #include "monitor.skel.h"
 
 #define CGROUP_BASE "/sys/fs/cgroup/ebpf-agent-monitor"
+#define MAX_AGENTS 16
 static volatile sig_atomic_t stop;
 
 struct run_identity {
@@ -26,6 +29,25 @@ struct run_identity {
     gid_t gid;
     char user[256];
     char home[PATH_MAX];
+};
+
+struct agent_process {
+    __u32 agent_id;
+    __u64 cgroup_id;
+    char cgroup_path[PATH_MAX];
+    char **command;
+    pid_t child;
+    int gate[2];
+    int ready[2];
+    int status;
+    int cgroup_created;
+    int registered;
+    int reaped;
+    int deny_shell;
+    const char *sensitive_path;
+    const char *workspace_path;
+    __u32 failed_open_threshold;
+    __u32 failed_open_window_ms;
 };
 
 static void on_signal(int sig) { (void)sig; stop = 1; }
@@ -43,8 +65,7 @@ static void print_header(const struct monitor_event_header *h,
 static int on_event(void *ctx, void *data, size_t size)
 {
     const struct monitor_event_header *h = data;
-
-    (void)ctx;
+    struct detector *detector = ctx;
     if (size < sizeof(*h) || h->size != size) {
         fprintf(stderr, "discarding malformed event: size=%zu\n", size);
         return 0;
@@ -59,6 +80,7 @@ static int on_event(void *ctx, void *data, size_t size)
         printf(" filename=%.*s\n", EVENT_FILENAME_LEN,
                event->payload.filename);
         fflush(stdout);
+        detector_process(detector, data, size);
         return 0;
     }
     case EVENT_PROCESS_FORK: {
@@ -90,6 +112,7 @@ static int on_event(void *ctx, void *data, size_t size)
                EVENT_FILENAME_LEN, event->payload.path,
                event->payload.flags, event->payload.path_ret);
         fflush(stdout);
+        detector_process(detector, data, size);
         return 0;
     }
     case EVENT_FILE_UNLINK_ATTEMPT: {
@@ -105,6 +128,41 @@ static int on_event(void *ctx, void *data, size_t size)
                dir_len && event->payload.dir_path[dir_len - 1] == '/' ? "" : "/",
                EVENT_FILENAME_LEN, event->payload.name,
                event->payload.path_ret, event->payload.name_ret);
+        fflush(stdout);
+        detector_process(detector, data, size);
+        return 0;
+    }
+    case EVENT_FILE_OPEN_RESULT: {
+        const struct file_open_result_event *event = data;
+
+        if (size != sizeof(*event))
+            break;
+        print_header(h, "FILE_OPEN_RESULT");
+        printf(" dirfd=%d attempted_path=%.*s ret=%d"
+               " path_basis=syscall_input\n",
+               event->payload.dirfd, EVENT_FILENAME_LEN,
+               event->payload.attempted_path, event->payload.ret);
+        fflush(stdout);
+        detector_process(detector, data, size);
+        return 0;
+    }
+    case EVENT_CONNECT_RESULT: {
+        const struct connect_event *event = data;
+        char address[INET6_ADDRSTRLEN] = "<invalid>";
+        int address_family;
+
+        if (size != sizeof(*event))
+            break;
+        address_family = event->payload.family == AF_INET ? AF_INET :
+                         event->payload.family == AF_INET6 ? AF_INET6 : 0;
+        if (address_family)
+            (void)inet_ntop(address_family, event->payload.destination_address,
+                            address, sizeof(address));
+
+        print_header(h, "CONNECT_RESULT");
+        printf(" socket_fd=%d family=%u dst_ip=%s dst_port=%u ret=%d\n",
+               event->payload.socket_fd, event->payload.family, address,
+               event->payload.destination_port, event->payload.ret);
         fflush(stdout);
         return 0;
     }
@@ -289,23 +347,176 @@ static void prepared_gated_exec(int gate_fd, int ready_fd, char **command,
     _exit(127);
 }
 
+static void print_usage(const char *program)
+{
+    fprintf(stderr,
+            "usage: %s --agent ID [--deny-shell]"
+            " [--sensitive-path DIR] [--workspace DIR]"
+            " [--failed-open-threshold N]"
+            " [--failed-open-window-ms MS] -- COMMAND [ARG ...]"
+            " [--next --agent ID [POLICY ...] -- COMMAND [ARG ...]]\n",
+            program);
+}
+
+static int parse_agents(int argc, char **argv, struct agent_process *agents,
+                        size_t *agent_count)
+{
+    int index = 1;
+    size_t count = 0;
+
+    while (index < argc) {
+        int command_start;
+        int separator;
+        int option_index;
+        size_t previous;
+
+        if (count >= MAX_AGENTS || strcmp(argv[index], "--agent") ||
+            index + 3 >= argc ||
+            parse_id(argv[index + 1], &agents[count].agent_id)) {
+            return -1;
+        }
+        for (previous = 0; previous < count; previous++) {
+            if (agents[previous].agent_id == agents[count].agent_id) {
+                fprintf(stderr, "duplicate agent id: %u\n",
+                        agents[count].agent_id);
+                return -1;
+            }
+        }
+
+        option_index = index + 2;
+        while (option_index < argc && strcmp(argv[option_index], "--")) {
+            if (!strcmp(argv[option_index], "--deny-shell")) {
+                if (agents[count].deny_shell)
+                    return -1;
+                agents[count].deny_shell = 1;
+            } else if (!strcmp(argv[option_index], "--sensitive-path")) {
+                if (agents[count].sensitive_path ||
+                    option_index + 1 >= argc)
+                    return -1;
+                agents[count].sensitive_path = argv[++option_index];
+            } else if (!strcmp(argv[option_index], "--workspace")) {
+                if (agents[count].workspace_path ||
+                    option_index + 1 >= argc)
+                    return -1;
+                agents[count].workspace_path = argv[++option_index];
+            } else if (!strcmp(argv[option_index],
+                               "--failed-open-threshold")) {
+                unsigned long value;
+
+                if (agents[count].failed_open_threshold ||
+                    option_index + 1 >= argc ||
+                    parse_unsigned(argv[++option_index], &value) ||
+                    !value || value > UINT32_MAX)
+                    return -1;
+                agents[count].failed_open_threshold = (__u32)value;
+            } else if (!strcmp(argv[option_index],
+                               "--failed-open-window-ms")) {
+                unsigned long value;
+
+                if (agents[count].failed_open_window_ms ||
+                    option_index + 1 >= argc ||
+                    parse_unsigned(argv[++option_index], &value) ||
+                    !value || value > UINT32_MAX)
+                    return -1;
+                agents[count].failed_open_window_ms = (__u32)value;
+            } else {
+                return -1;
+            }
+            option_index++;
+        }
+        if (option_index == argc)
+            return -1;
+
+        if (!!agents[count].failed_open_threshold !=
+            !!agents[count].failed_open_window_ms)
+            return -1;
+
+        command_start = option_index + 1;
+        separator = command_start;
+        while (separator < argc && strcmp(argv[separator], "--next"))
+            separator++;
+        if (separator == command_start)
+            return -1;
+
+        agents[count].command = &argv[command_start];
+        count++;
+        if (separator == argc)
+            break;
+
+        argv[separator] = NULL;
+        index = separator + 1;
+        if (index == argc)
+            return -1;
+    }
+
+    if (!count)
+        return -1;
+    *agent_count = count;
+    return 0;
+}
+
+static int status_result(int status)
+{
+    if (WIFEXITED(status))
+        return WEXITSTATUS(status);
+    if (WIFSIGNALED(status))
+        return 128 + WTERMSIG(status);
+    return 1;
+}
+
+static void print_agent_exit(const struct agent_process *agent)
+{
+    if (WIFEXITED(agent->status)) {
+        printf("event=agent_exit agent_id=%u cgroup_id=%" PRIu64
+               " root_pid=%ld exit_code=%d\n",
+               agent->agent_id, (uint64_t)agent->cgroup_id,
+               (long)agent->child, WEXITSTATUS(agent->status));
+    } else if (WIFSIGNALED(agent->status)) {
+        printf("event=agent_exit agent_id=%u cgroup_id=%" PRIu64
+               " root_pid=%ld signal=%d\n",
+               agent->agent_id, (uint64_t)agent->cgroup_id,
+               (long)agent->child, WTERMSIG(agent->status));
+    }
+    fflush(stdout);
+}
+
 int main(int argc, char **argv)
 {
     struct monitor_bpf *skel = NULL;
     struct ring_buffer *rb = NULL;
     struct run_identity identity = {0};
-    char cg_path[PATH_MAX] = {0};
-    __u32 agent_id;
-    __u64 cg_id = 0;
-    pid_t child = -1;
-    int gate[2] = {-1, -1}, ready[2] = {-1, -1};
-    int status = 0, map_fd = -1, err = 0, result = 1;
-    int made_base = 0, made_cgroup = 0, registered = 0, reaped = 0;
+    struct agent_process agents[MAX_AGENTS] = {0};
+    struct detector detector;
+    size_t agent_count = 0;
+    size_t index;
+    size_t remaining;
+    int map_fd = -1;
+    int base_created = 0;
+    int terminate_sent = 0;
+    int result = 1;
+    int err = 0;
 
-    if (argc < 5 || strcmp(argv[1], "--agent") ||
-        parse_id(argv[2], &agent_id) || strcmp(argv[3], "--")) {
-        fprintf(stderr, "usage: %s --agent AGENT_ID -- COMMAND [ARG ...]\n", argv[0]);
+    for (index = 0; index < MAX_AGENTS; index++) {
+        agents[index].child = -1;
+        agents[index].gate[0] = agents[index].gate[1] = -1;
+        agents[index].ready[0] = agents[index].ready[1] = -1;
+    }
+
+    if (parse_agents(argc, argv, agents, &agent_count)) {
+        print_usage(argv[0]);
         return 2;
+    }
+    detector_init(&detector);
+    for (index = 0; index < agent_count; index++) {
+        if (detector_add_agent(&detector, agents[index].agent_id,
+                               agents[index].deny_shell,
+                               agents[index].sensitive_path,
+                               agents[index].workspace_path,
+                               agents[index].failed_open_threshold,
+                               agents[index].failed_open_window_ms)) {
+            fprintf(stderr, "failed to configure detector\n");
+            return 1;
+        }
     }
     if (geteuid()) {
         fprintf(stderr, "controlled launch requires root privileges\n");
@@ -313,6 +524,7 @@ int main(int argc, char **argv)
     }
     if (read_sudo_identity(&identity))
         return 1;
+
     signal(SIGINT, on_signal);
     signal(SIGTERM, on_signal);
 
@@ -322,116 +534,183 @@ int main(int argc, char **argv)
         fprintf(stderr, "failed to open/load/attach BPF program: %d\n", err);
         goto cleanup;
     }
-    rb = ring_buffer__new(bpf_map__fd(skel->maps.events), on_event, NULL, NULL);
+    rb = ring_buffer__new(bpf_map__fd(skel->maps.events),
+                          on_event, &detector, NULL);
     if (!rb) {
         fprintf(stderr, "failed to create ring buffer\n");
         goto cleanup;
     }
-    if (create_cgroup(cg_path, sizeof(cg_path), agent_id, &made_base))
-        goto cleanup;
-    made_cgroup = 1;
-    if (cgroup_id(cg_path, &cg_id))
-        goto cleanup;
-
     map_fd = bpf_map__fd(skel->maps.agent_by_cgroup);
-    if (bpf_map_update_elem(map_fd, &cg_id, &agent_id, BPF_ANY)) {
-        perror("register Agent cgroup");
-        goto cleanup;
-    }
-    registered = 1;
 
-    if (pipe2(gate, O_CLOEXEC) || pipe2(ready, O_CLOEXEC) ||
-        (child = fork()) < 0) {
-        perror("create prepared gated child");
-        goto cleanup;
-    }
-    if (!child) {
-        close(gate[1]);
-        close(ready[0]);
-        prepared_gated_exec(gate[0], ready[1], &argv[4], &identity);
-    }
-
-    close(gate[0]);
-    gate[0] = -1;
-    close(ready[1]);
-    ready[1] = -1;
-
-    {
+    /*
+     * 每个孩子先在原 cgroup 完成 initgroups。全部孩子都完成迁移和登记后，
+     * 父进程才统一放行，避免任一 Agent 提前产生业务事件。
+     */
+    for (index = 0; index < agent_count; index++) {
+        struct agent_process *agent = &agents[index];
         char prepared;
-        ssize_t n;
+        ssize_t count_read;
 
-        do { n = read(ready[0], &prepared, 1); } while (n < 0 && errno == EINTR);
-        close(ready[0]);
-        ready[0] = -1;
-        if (n != 1 || prepared != 'r') {
-            fprintf(stderr, "Agent identity preparation failed\n");
+        if (create_cgroup(agent->cgroup_path, sizeof(agent->cgroup_path),
+                          agent->agent_id, &base_created))
+            goto cleanup;
+        agent->cgroup_created = 1;
+        if (cgroup_id(agent->cgroup_path, &agent->cgroup_id))
+            goto cleanup;
+        if (bpf_map_update_elem(map_fd, &agent->cgroup_id,
+                                &agent->agent_id, BPF_ANY)) {
+            perror("register Agent cgroup");
             goto cleanup;
         }
+        agent->registered = 1;
+
+        if (pipe2(agent->gate, O_CLOEXEC) ||
+            pipe2(agent->ready, O_CLOEXEC) ||
+            (agent->child = fork()) < 0) {
+            perror("create prepared gated child");
+            goto cleanup;
+        }
+        if (!agent->child) {
+            size_t other;
+
+            for (other = 0; other <= index; other++) {
+                if (other != index) {
+                    if (agents[other].gate[0] >= 0)
+                        close(agents[other].gate[0]);
+                    if (agents[other].gate[1] >= 0)
+                        close(agents[other].gate[1]);
+                    if (agents[other].ready[0] >= 0)
+                        close(agents[other].ready[0]);
+                    if (agents[other].ready[1] >= 0)
+                        close(agents[other].ready[1]);
+                }
+            }
+            close(agent->gate[1]);
+            close(agent->ready[0]);
+            prepared_gated_exec(agent->gate[0], agent->ready[1],
+                                agent->command, &identity);
+        }
+
+        close(agent->gate[0]);
+        agent->gate[0] = -1;
+        close(agent->ready[1]);
+        agent->ready[1] = -1;
+
+        do {
+            count_read = read(agent->ready[0], &prepared, 1);
+        } while (count_read < 0 && errno == EINTR);
+        close(agent->ready[0]);
+        agent->ready[0] = -1;
+        if (count_read != 1 || prepared != 'r') {
+            fprintf(stderr, "Agent %u identity preparation failed\n",
+                    agent->agent_id);
+            goto cleanup;
+        }
+
+        if (move_and_verify(agent->cgroup_path, agent->child))
+            goto cleanup;
+        printf("event=agent_register agent_id=%u cgroup_id=%" PRIu64
+               " root_pid=%ld run_uid=%lu run_gid=%lu"
+               " basis=controlled_launch\n",
+               agent->agent_id, (uint64_t)agent->cgroup_id,
+               (long)agent->child, (unsigned long)identity.uid,
+               (unsigned long)identity.gid);
+        fflush(stdout);
     }
 
-    if (move_and_verify(cg_path, child))
-        goto cleanup;
-    printf("event=agent_register agent_id=%u cgroup_id=%" PRIu64
-           " root_pid=%ld run_uid=%lu run_gid=%lu basis=controlled_launch\n",
-           agent_id, (uint64_t)cg_id, (long)child,
-           (unsigned long)identity.uid, (unsigned long)identity.gid);
-    fflush(stdout);
-
-    if (write(gate[1], "x", 1) != 1) {
-        perror("release child");
-        goto cleanup;
+    for (index = 0; index < agent_count; index++) {
+        if (write(agents[index].gate[1], "x", 1) != 1) {
+            perror("release Agent");
+            goto cleanup;
+        }
+        close(agents[index].gate[1]);
+        agents[index].gate[1] = -1;
     }
-    close(gate[1]);
-    gate[1] = -1;
 
-    for (;;) {
-        pid_t waited;
+    remaining = agent_count;
+    while (remaining) {
+        int newly_reaped = 0;
+
         err = ring_buffer__poll(rb, 100);
         if (err < 0 && err != -EINTR) {
             fprintf(stderr, "ring buffer poll failed: %d\n", err);
             goto cleanup;
         }
-        waited = waitpid(child, &status, WNOHANG);
-        if (waited == child) {
-            reaped = 1;
-            break;
-        }
-        if (waited < 0 && errno != EINTR) {
-            perror("waitpid");
-            goto cleanup;
-        }
-        if (stop)
-            kill(child, SIGTERM);
-    }
-    ring_buffer__consume(rb);
 
-    if (WIFEXITED(status)) {
-        result = WEXITSTATUS(status);
-        printf("event=agent_exit agent_id=%u cgroup_id=%" PRIu64
-               " root_pid=%ld exit_code=%d\n",
-               agent_id, (uint64_t)cg_id, (long)child, result);
-    } else if (WIFSIGNALED(status)) {
-        result = 128 + WTERMSIG(status);
-        printf("event=agent_exit agent_id=%u cgroup_id=%" PRIu64
-               " root_pid=%ld signal=%d\n",
-               agent_id, (uint64_t)cg_id, (long)child, WTERMSIG(status));
+        for (index = 0; index < agent_count; index++) {
+            pid_t waited;
+
+            if (agents[index].reaped)
+                continue;
+            waited = waitpid(agents[index].child, &agents[index].status,
+                             WNOHANG);
+            if (waited == agents[index].child) {
+                agents[index].reaped = 1;
+                remaining--;
+                newly_reaped = 1;
+            } else if (waited < 0 && errno != EINTR) {
+                perror("waitpid");
+                goto cleanup;
+            }
+        }
+
+        if (newly_reaped) {
+            (void)ring_buffer__consume(rb);
+            for (index = 0; index < agent_count; index++) {
+                if (agents[index].reaped && agents[index].child > 0) {
+                    print_agent_exit(&agents[index]);
+                    agents[index].child = -agents[index].child;
+                }
+            }
+        }
+
+        if (stop && !terminate_sent) {
+            for (index = 0; index < agent_count; index++) {
+                if (!agents[index].reaped && agents[index].child > 0)
+                    (void)kill(agents[index].child, SIGTERM);
+            }
+            terminate_sent = 1;
+        }
+    }
+
+    result = 0;
+    for (index = 0; index < agent_count; index++) {
+        int agent_result = status_result(agents[index].status);
+        if (!result && agent_result)
+            result = agent_result;
     }
 
 cleanup:
-    if (gate[0] >= 0) close(gate[0]);
-    if (gate[1] >= 0) close(gate[1]);
-    if (ready[0] >= 0) close(ready[0]);
-    if (ready[1] >= 0) close(ready[1]);
-    if (child > 0 && !reaped) {
-        kill(child, SIGKILL);
-        while (waitpid(child, &status, 0) < 0 && errno == EINTR) {}
+    for (index = 0; index < agent_count; index++) {
+        struct agent_process *agent = &agents[index];
+        pid_t child_pid = agent->child < 0 ? -agent->child : agent->child;
+
+        if (agent->gate[0] >= 0)
+            close(agent->gate[0]);
+        if (agent->gate[1] >= 0)
+            close(agent->gate[1]);
+        if (agent->ready[0] >= 0)
+            close(agent->ready[0]);
+        if (agent->ready[1] >= 0)
+            close(agent->ready[1]);
+
+        if (child_pid > 0 && !agent->reaped) {
+            (void)kill(child_pid, SIGKILL);
+            while (waitpid(child_pid, &agent->status, 0) < 0 &&
+                   errno == EINTR) {
+            }
+        }
+        if (agent->registered &&
+            bpf_map_delete_elem(map_fd, &agent->cgroup_id) &&
+            errno != ENOENT) {
+            perror("unregister Agent cgroup");
+        }
+        if (agent->cgroup_created && rmdir(agent->cgroup_path))
+            perror("remove Agent cgroup");
     }
-    if (registered && bpf_map_delete_elem(map_fd, &cg_id) && errno != ENOENT)
-        perror("unregister Agent cgroup");
-    if (made_cgroup && rmdir(cg_path))
-        perror("remove Agent cgroup");
-    if (made_base && rmdir(CGROUP_BASE) && errno != ENOTEMPTY)
+    if (base_created && rmdir(CGROUP_BASE) && errno != ENOTEMPTY)
         perror("remove cgroup base");
+
     ring_buffer__free(rb);
     monitor_bpf__destroy(skel);
     return result;
