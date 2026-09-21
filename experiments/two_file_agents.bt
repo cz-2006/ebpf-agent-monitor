@@ -1,0 +1,86 @@
+// Experiment 3c: launcher must fork exactly two direct children, in order.
+// Single-threaded tasks only. Launcher itself is not an Agent.
+BEGIN
+{
+    @next_agent = 0;
+    printf("event=launcher pid=%d\n", cpid);
+}
+
+tracepoint:sched:sched_process_fork
+/(uint32)args->parent_pid == cpid || @agent[args->parent_pid]/
+{
+    if ((uint32)args->parent_pid == cpid) {
+        @next_agent = @next_agent + 1;
+        @agent[args->child_pid] = @next_agent;
+        printf("mono_ns=%llu event=register root_pid=%d agent_id=%d basis=launcher_fork_order\n",
+               nsecs, args->child_pid, @agent[args->child_pid]);
+    } else {
+        @agent[args->child_pid] = @agent[args->parent_pid];
+        printf("mono_ns=%llu event=fork parent_pid=%d child_pid=%d agent_id=%d basis=fork\n",
+               nsecs, args->parent_pid, args->child_pid, @agent[args->child_pid]);
+    }
+}
+
+tracepoint:syscalls:sys_enter_openat
+/@agent[tid]/
+{
+    $name = str(args->filename);
+    if (strncmp($name, "/tmp/ebpf-exp3-", 15) == 0) {
+        @open_path[tid] = $name;
+        @open_started[tid] = nsecs;
+        @open_flags[tid] = args->flags;
+    }
+}
+
+tracepoint:syscalls:sys_exit_openat
+/@open_started[tid]/
+{
+    printf("mono_ns=%llu enter_ns=%llu event=openat_result pid=%d tid=%d agent_id=%d filename=%s flags=%d ret=%lld basis=tracked_task\n",
+           nsecs, @open_started[tid], pid, tid, @agent[tid], @open_path[tid], @open_flags[tid], args->ret);
+    delete(@open_path[tid]);
+    delete(@open_started[tid]);
+    delete(@open_flags[tid]);
+}
+
+tracepoint:syscalls:sys_enter_unlink
+/@agent[tid]/
+{
+    $name = str(args->pathname);
+    if (strncmp($name, "/tmp/ebpf-exp3-", 15) == 0) {
+        @unlink_path[tid] = $name;
+        @unlink_started[tid] = nsecs;
+    }
+}
+
+tracepoint:syscalls:sys_exit_unlink
+/@unlink_started[tid]/
+{
+    printf("mono_ns=%llu enter_ns=%llu event=unlink_result pid=%d tid=%d agent_id=%d filename=%s ret=%lld basis=tracked_task\n",
+           nsecs, @unlink_started[tid], pid, tid, @agent[tid], @unlink_path[tid], args->ret);
+    delete(@unlink_path[tid]);
+    delete(@unlink_started[tid]);
+}
+
+tracepoint:sched:sched_process_exit
+/@agent[tid]/
+{
+    printf("mono_ns=%llu event=exit pid=%d tid=%d agent_id=%d\n",
+           nsecs, pid, tid, @agent[tid]);
+    delete(@agent[tid]);
+    delete(@open_path[tid]);
+    delete(@open_started[tid]);
+    delete(@open_flags[tid]);
+    delete(@unlink_path[tid]);
+    delete(@unlink_started[tid]);
+}
+
+END
+{
+    clear(@agent);
+    clear(@open_path);
+    clear(@open_started);
+    clear(@open_flags);
+    clear(@unlink_path);
+    clear(@unlink_started);
+    clear(@next_agent);
+}

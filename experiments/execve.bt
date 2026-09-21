@@ -1,0 +1,7 @@
+// Observe only the process launched by bpftrace -c.
+tracepoint:syscalls:sys_enter_execve
+/pid == cpid/
+{
+    printf("mono_ns=%llu pid=%d tid=%d event=execve_attempt filename=%s\n",
+           nsecs, pid, tid, str(args->filename));
+}

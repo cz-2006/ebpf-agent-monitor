@@ -1,0 +1,43 @@
+// Experiment 2b: launcher must fork exactly two direct children, in order.
+// Single-threaded tasks only. Launcher itself is not an Agent.
+BEGIN
+{
+    @next_agent = 0;
+    printf("event=launcher pid=%d\n", cpid);
+}
+
+tracepoint:sched:sched_process_fork
+/(uint32)args->parent_pid == cpid || @agent[args->parent_pid]/
+{
+    if ((uint32)args->parent_pid == cpid) {
+        @next_agent = @next_agent + 1;
+        @agent[args->child_pid] = @next_agent;
+        printf("mono_ns=%llu event=register root_pid=%d agent_id=%d basis=launcher_fork_order\n",
+               nsecs, args->child_pid, @agent[args->child_pid]);
+    } else {
+        @agent[args->child_pid] = @agent[args->parent_pid];
+        printf("mono_ns=%llu event=fork parent_pid=%d child_pid=%d agent_id=%d basis=fork\n",
+               nsecs, args->parent_pid, args->child_pid, @agent[args->child_pid]);
+    }
+}
+
+tracepoint:syscalls:sys_enter_execve
+/@agent[tid]/
+{
+    printf("mono_ns=%llu event=execve_attempt pid=%d tid=%d agent_id=%d filename=%s basis=tracked_task\n",
+           nsecs, pid, tid, @agent[tid], str(args->filename));
+}
+
+tracepoint:sched:sched_process_exit
+/@agent[tid]/
+{
+    printf("mono_ns=%llu event=exit pid=%d tid=%d agent_id=%d\n",
+           nsecs, pid, tid, @agent[tid]);
+    delete(@agent[tid]);
+}
+
+END
+{
+    clear(@agent);
+    clear(@next_agent);
+}

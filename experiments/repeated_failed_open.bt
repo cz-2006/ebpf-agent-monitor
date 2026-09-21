@@ -1,0 +1,86 @@
+// 实验⑥a：2 秒内对同一路径连续 5 次 openat 返回 ENOENT 时告警。
+// 固定路径和阈值仅用于验证，正式系统应放到用户态配置。
+BEGIN
+{
+    @agent[cpid] = 1;
+    printf("event=register root_pid=%d agent_id=1 rule=repeated_failed_open window_ms=2000 threshold=5 basis=launch\n",
+           cpid);
+}
+
+tracepoint:sched:sched_process_fork
+/@agent[args->parent_pid]/
+{
+    @agent[args->child_pid] = @agent[args->parent_pid];
+    printf("mono_ns=%llu event=fork parent_pid=%d child_pid=%d agent_id=%d basis=fork\n",
+           nsecs, args->parent_pid, args->child_pid, @agent[args->child_pid]);
+}
+
+// Linux openat 入口：只配对本实验的固定缺失路径。
+tracepoint:syscalls:sys_enter_openat
+/@agent[tid]/
+{
+    $name = str(args->filename);
+    if (strncmp($name, "/tmp/ebpf-exp6-repeat/missing.txt", 34) == 0) {
+        @path[tid] = $name;
+        @started[tid] = nsecs;
+    }
+}
+
+// Linux openat 返回：累计同一 Agent 在时间窗口内的 ENOENT 次数。
+tracepoint:syscalls:sys_exit_openat
+/@started[tid]/
+{
+    $agent_id = @agent[tid];
+    $now = nsecs;
+    printf("mono_ns=%llu enter_ns=%llu event=openat_result pid=%d tid=%d agent_id=%d filename=%s ret=%lld basis=tracked_task\n",
+           $now, @started[tid], pid, tid, $agent_id, @path[tid], args->ret);
+
+    if (args->ret == -2) {
+        if (@window_start[$agent_id] == 0 ||
+            $now - @window_start[$agent_id] > 2000000000) {
+            @window_start[$agent_id] = $now;
+            @failed_count[$agent_id] = 0;
+            @alerted[$agent_id] = 0;
+        }
+
+        @failed_count[$agent_id] = @failed_count[$agent_id] + 1;
+        $elapsed = $now - @window_start[$agent_id];
+        printf("mono_ns=%llu event=activity_evidence rule=repeated_failed_open pid=%d tid=%d agent_id=%d target=%s errno=2 count=%d threshold=5 window_ms=2000 elapsed_ns=%llu\n",
+               $now, pid, tid, $agent_id, @path[tid],
+               @failed_count[$agent_id], $elapsed);
+
+        if (@failed_count[$agent_id] >= 5 && @alerted[$agent_id] == 0) {
+            printf("mono_ns=%llu event=security_alert severity=medium rule=repeated_failed_open pid=%d tid=%d agent_id=%d target=%s errno=2 count=%d threshold=5 window_ms=2000 elapsed_ns=%llu evidence=same_target,repeated_enoent,time_window,process_tree_attribution\n",
+                   $now, pid, tid, $agent_id, @path[tid],
+                   @failed_count[$agent_id], $elapsed);
+            @alerted[$agent_id] = 1;
+        }
+    }
+
+    delete(@path[tid]);
+    delete(@started[tid]);
+}
+
+tracepoint:sched:sched_process_exit
+/@agent[tid]/
+{
+    $agent_id = @agent[tid];
+    printf("mono_ns=%llu event=exit pid=%d tid=%d agent_id=%d\n",
+           nsecs, pid, tid, $agent_id);
+    delete(@agent[tid]);
+    delete(@path[tid]);
+    delete(@started[tid]);
+    delete(@window_start[$agent_id]);
+    delete(@failed_count[$agent_id]);
+    delete(@alerted[$agent_id]);
+}
+
+END
+{
+    clear(@agent);
+    clear(@path);
+    clear(@started);
+    clear(@window_start);
+    clear(@failed_count);
+    clear(@alerted);
+}

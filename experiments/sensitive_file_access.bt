@@ -1,0 +1,79 @@
+// 实验⑤b：/tmp/ebpf-exp5-sensitive-* 被定义为 Agent 1 的敏感路径。
+// 启动器负责准备和清理夹具；它自身不是 Agent。
+BEGIN
+{
+    printf("event=launcher pid=%d policy=sensitive_read_denied\n", cpid);
+}
+
+// 启动器的直接孩子登记为 Agent 1；其后代继续继承标签。
+tracepoint:sched:sched_process_fork
+/(uint32)args->parent_pid == cpid || @agent[args->parent_pid]/
+{
+    if ((uint32)args->parent_pid == cpid) {
+        @agent[args->child_pid] = 1;
+        printf("mono_ns=%llu event=register root_pid=%d agent_id=1 basis=launcher_fork\n",
+               nsecs, args->child_pid);
+    } else {
+        @agent[args->child_pid] = @agent[args->parent_pid];
+        printf("mono_ns=%llu event=fork parent_pid=%d child_pid=%d agent_id=%d basis=fork\n",
+               nsecs, args->parent_pid, args->child_pid, @agent[args->child_pid]);
+    }
+}
+
+// Linux openat 系统调用入口：此时可以读取用户传入的路径和 flags。
+tracepoint:syscalls:sys_enter_openat
+/@agent[tid]/
+{
+    $name = str(args->filename);
+    // 只记录模拟敏感目录中的路径，减少其他 openat 噪声。
+    if (strncmp($name, "/tmp/ebpf-exp5-sensitive-", 25) == 0) {
+        // 按 TID 保存入口参数，供返回探针配对。
+        @path[tid] = $name;
+        @flags[tid] = args->flags;
+        @started[tid] = nsecs;
+    }
+}
+
+// Linux openat 系统调用返回点：此时 args->ret 表示打开结果。
+tracepoint:syscalls:sys_exit_openat
+/@started[tid]/
+{
+    // ret>=0 表示打开成功；负数是原始错误码。
+    printf("mono_ns=%llu enter_ns=%llu event=openat_result pid=%d tid=%d agent_id=%d filename=%s flags=%d ret=%lld basis=tracked_task\n",
+           nsecs, @started[tid], pid, tid, @agent[tid], @path[tid],
+           @flags[tid], args->ret);
+
+    // 成功访问比失败尝试使用更高的告警级别。
+    if (args->ret >= 0) {
+        printf("mono_ns=%llu event=security_alert severity=high rule=sensitive_file_access pid=%d tid=%d agent_id=%d target=%s flags=%d ret=%lld outcome=success policy=sensitive_read_denied evidence=openat_result,path_policy,process_tree_attribution\n",
+               nsecs, pid, tid, @agent[tid], @path[tid], @flags[tid], args->ret);
+    } else {
+        printf("mono_ns=%llu event=security_alert severity=medium rule=sensitive_file_access pid=%d tid=%d agent_id=%d target=%s flags=%d ret=%lld outcome=failed policy=sensitive_read_denied evidence=openat_result,path_policy,process_tree_attribution\n",
+               nsecs, pid, tid, @agent[tid], @path[tid], @flags[tid], args->ret);
+    }
+
+    // 本次调用处理完成后删除临时配对状态。
+    delete(@path[tid]);
+    delete(@flags[tid]);
+    delete(@started[tid]);
+}
+
+tracepoint:sched:sched_process_exit
+/@agent[tid]/
+{
+    printf("mono_ns=%llu event=exit pid=%d tid=%d agent_id=%d\n",
+           nsecs, pid, tid, @agent[tid]);
+    // 任务退出时清理归属和可能残留的调用状态。
+    delete(@agent[tid]);
+    delete(@path[tid]);
+    delete(@flags[tid]);
+    delete(@started[tid]);
+}
+
+END
+{
+    clear(@agent);
+    clear(@path);
+    clear(@flags);
+    clear(@started);
+}

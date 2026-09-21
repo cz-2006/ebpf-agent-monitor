@@ -1,0 +1,51 @@
+// Experiment 3b: unlink entry/exit pairing for short absolute test paths.
+// This workload is single-threaded; task IDs equal process IDs here.
+BEGIN
+{
+    @agent[cpid] = 1;
+    printf("event=register root_pid=%d agent_id=1 basis=launch\n", cpid);
+}
+
+tracepoint:sched:sched_process_fork
+/@agent[args->parent_pid]/
+{
+    @agent[args->child_pid] = @agent[args->parent_pid];
+    printf("mono_ns=%llu event=fork parent_pid=%d child_pid=%d agent_id=%d basis=fork\n",
+           nsecs, args->parent_pid, args->child_pid, @agent[args->child_pid]);
+}
+
+tracepoint:syscalls:sys_enter_unlink
+/@agent[tid]/
+{
+    $name = str(args->pathname);
+    if (strncmp($name, "/tmp/ebpf-exp3-", 15) == 0) {
+        @path[tid] = $name;
+        @started[tid] = nsecs;
+    }
+}
+
+tracepoint:syscalls:sys_exit_unlink
+/@started[tid]/
+{
+    printf("mono_ns=%llu enter_ns=%llu event=unlink_result pid=%d tid=%d agent_id=%d filename=%s ret=%lld basis=tracked_task\n",
+           nsecs, @started[tid], pid, tid, @agent[tid], @path[tid], args->ret);
+    delete(@path[tid]);
+    delete(@started[tid]);
+}
+
+tracepoint:sched:sched_process_exit
+/@agent[tid]/
+{
+    printf("mono_ns=%llu event=exit pid=%d tid=%d agent_id=%d\n",
+           nsecs, pid, tid, @agent[tid]);
+    delete(@agent[tid]);
+    delete(@path[tid]);
+    delete(@started[tid]);
+}
+
+END
+{
+    clear(@agent);
+    clear(@path);
+    clear(@started);
+}

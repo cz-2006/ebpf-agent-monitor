@@ -1,0 +1,79 @@
+// 实验④a：观察 IPv4 connect 的目标和结果，不读取通信内容。
+// 对应 Linux sockaddr_in 布局，端口分为高、低字节读取。
+struct exp4_sockaddr_in {
+    unsigned short family;
+    unsigned char port_hi;
+    unsigned char port_lo;
+    unsigned int address;
+    unsigned char padding[8];
+};
+
+// 启动时，将 -c 启动的根进程登记为 Agent 1。
+BEGIN
+{
+    @agent[cpid] = 1;
+    printf("event=register root_pid=%d agent_id=1 basis=launch\n", cpid);
+}
+
+// 如果创建子任务，让它继承父任务的 Agent 标签。
+tracepoint:sched:sched_process_fork
+/@agent[args->parent_pid]/
+{
+    @agent[args->child_pid] = @agent[args->parent_pid];
+    printf("mono_ns=%llu event=fork parent_pid=%d child_pid=%d agent_id=%d basis=fork\n",
+           nsecs, args->parent_pid, args->child_pid, @agent[args->child_pid]);
+}
+
+// 入口：只记录已登记任务，按 TID 保存本次连接参数。
+tracepoint:syscalls:sys_enter_connect
+/@agent[tid]/
+{
+    if (args->addrlen >= 16) {  // IPv4 地址结构需要至少 16 字节。
+        // uptr 表示从调用进程的用户态内存读取地址。
+        $addr = (struct exp4_sockaddr_in *)uptr(args->uservaddr);
+        if ($addr->family == 2) {  // 2 即 AF_INET（IPv4）。
+            @address[tid] = $addr->address;
+            // 网络序端口：高字节 × 256 + 低字节。
+            @port[tid] = (uint64)$addr->port_hi * 256 + (uint64)$addr->port_lo;
+            @fd[tid] = args->fd;
+            @started[tid] = nsecs;  // 保存入口时间，同时标记待配对调用。
+        }
+    }
+}
+
+// 返回：找回同一 TID 的入口参数；ntop 将 IP 转为可读文本。
+// 本轮阻塞连接 ret=0 表示成功，输出后删除本次配对记录。
+tracepoint:syscalls:sys_exit_connect
+/@started[tid]/
+{
+    printf("mono_ns=%llu enter_ns=%llu event=connect_result pid=%d tid=%d agent_id=%d fd=%d family=2 dst_ip=%s dst_port=%llu ret=%lld basis=tracked_task\n",
+           nsecs, @started[tid], pid, tid, @agent[tid], @fd[tid],
+           ntop(2, (uint32)@address[tid]), @port[tid], args->ret);
+    delete(@address[tid]);
+    delete(@port[tid]);
+    delete(@fd[tid]);
+    delete(@started[tid]);
+}
+
+// 任务退出：删除归属标签和可能残留的连接记录。
+tracepoint:sched:sched_process_exit
+/@agent[tid]/
+{
+    printf("mono_ns=%llu event=exit pid=%d tid=%d agent_id=%d\n",
+           nsecs, pid, tid, @agent[tid]);
+    delete(@agent[tid]);
+    delete(@address[tid]);
+    delete(@port[tid]);
+    delete(@fd[tid]);
+    delete(@started[tid]);
+}
+
+// 监控结束：清空所有表。
+END
+{
+    clear(@agent);
+    clear(@address);
+    clear(@port);
+    clear(@fd);
+    clear(@started);
+}

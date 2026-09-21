@@ -1,0 +1,35 @@
+// Experiment 2a: only the supplied single-threaded fork/exec workload.
+// Keys are task IDs (TIDs); these equal PIDs in this workload. Agent 1 = A.
+BEGIN
+{
+    @agent[cpid] = 1;
+    printf("event=register root_pid=%d agent_id=1 basis=launch\n", cpid);
+}
+
+tracepoint:sched:sched_process_fork
+/@agent[args->parent_pid]/
+{
+    @agent[args->child_pid] = @agent[args->parent_pid];
+    printf("mono_ns=%llu event=fork parent_pid=%d child_pid=%d agent_id=%d basis=fork\n",
+           nsecs, args->parent_pid, args->child_pid, @agent[args->child_pid]);
+}
+
+tracepoint:syscalls:sys_enter_execve
+/@agent[tid]/
+{
+    printf("mono_ns=%llu event=execve_attempt pid=%d tid=%d agent_id=%d filename=%s basis=tracked_task\n",
+           nsecs, pid, tid, @agent[tid], str(args->filename));
+}
+
+tracepoint:sched:sched_process_exit
+/@agent[tid]/
+{
+    printf("mono_ns=%llu event=exit pid=%d tid=%d agent_id=%d\n",
+           nsecs, pid, tid, @agent[tid]);
+    delete(@agent[tid]);
+}
+
+END
+{
+    clear(@agent);
+}
