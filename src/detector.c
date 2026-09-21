@@ -38,7 +38,8 @@ int detector_add_agent(struct detector *detector, __u32 agent_id,
                        int deny_shell, const char *sensitive_path,
                        const char *workspace_path,
                        __u32 failed_open_threshold,
-                       __u32 failed_open_window_ms)
+                       __u32 failed_open_window_ms,
+                       __u32 cpu_threshold_percent)
 {
     struct detector_agent_policy *policy;
 
@@ -50,6 +51,7 @@ int detector_add_agent(struct detector *detector, __u32 agent_id,
     policy->deny_shell = deny_shell;
     policy->failed_open_threshold = failed_open_threshold;
     policy->failed_open_window_ms = failed_open_window_ms;
+    policy->cpu_threshold_percent = cpu_threshold_percent;
     if (sensitive_path &&
         normalize_policy_dir(policy->sensitive_dir,
                              sizeof(policy->sensitive_dir),
@@ -346,11 +348,15 @@ static void detect_repeated_failed_open(
     if (elapsed_ns > window_ns) {
         state->count = 0;
         state->alerted = 0;
+        state->joint_alerted = 0;
         state->window_start_ns = header->timestamp_ns;
         elapsed_ns = 0;
     }
     state->count++;
     state->last_seen_ns = header->timestamp_ns;
+    state->pid = header->pid;
+    state->tid = header->tid;
+    state->cgroup_id = header->cgroup_id;
 
     printf("timestamp_ns=%" PRIu64
            " event=activity_evidence rule=repeated_failed_open"
@@ -380,6 +386,71 @@ static void detect_repeated_failed_open(
                policy->failed_open_threshold, policy->failed_open_window_ms,
                (uint64_t)elapsed_ns, reconstruction);
         state->alerted = 1;
+    }
+    fflush(stdout);
+}
+
+
+void detector_process_cpu_sample(
+    struct detector *detector, const struct resource_cpu_sample *sample)
+{
+    const struct detector_agent_policy *policy;
+    size_t index;
+
+    if (!detector || !sample)
+        return;
+    policy = find_policy(detector, sample->agent_id);
+    if (!policy || !policy->cpu_threshold_percent)
+        return;
+
+    printf("timestamp_ns=%" PRIu64
+           " event=resource_sample metric=cpu agent_id=%u cgroup_id=%" PRIu64
+           " interval_usec=%" PRIu64 " usage_delta_usec=%" PRIu64
+           " cpu_percent=%" PRIu64 ".%02" PRIu64
+           " basis=cgroup_cpu_stat_single_core\n",
+           (uint64_t)sample->timestamp_ns, sample->agent_id,
+           (uint64_t)sample->cgroup_id, (uint64_t)sample->interval_usec,
+           (uint64_t)sample->usage_delta_usec,
+           (uint64_t)(sample->cpu_percent_x100 / 100),
+           (uint64_t)(sample->cpu_percent_x100 % 100));
+
+    if (sample->cpu_percent_x100 <
+        (__u64)policy->cpu_threshold_percent * 100ULL) {
+        fflush(stdout);
+        return;
+    }
+
+    for (index = 0; index < DETECTOR_MAX_FAILED_OPEN_STATES; index++) {
+        struct failed_open_state *state =
+            &detector->failed_open_states[index];
+        __u64 window_ns;
+
+        if (!state->used || !state->alerted || state->joint_alerted ||
+            state->agent_id != sample->agent_id ||
+            state->cgroup_id != sample->cgroup_id ||
+            sample->timestamp_ns < state->window_start_ns)
+            continue;
+        window_ns = (__u64)policy->failed_open_window_ms * 1000000ULL;
+        if (sample->timestamp_ns - state->window_start_ns > window_ns)
+            continue;
+
+        printf("timestamp_ns=%" PRIu64
+               " event=anomaly_alert severity=high"
+               " rule=resource_logic_anomaly"
+               " pid=%u tid=%u agent_id=%u cgroup_id=%" PRIu64
+               " target=%s repeated_failed_open_count=%u"
+               " cpu_percent=%" PRIu64 ".%02" PRIu64
+               " cpu_threshold_percent=%u window_ms=%u"
+               " evidence=high_cpu,repeated_failed_open,same_agent,"
+               "time_window,cgroup_attribution\n",
+               (uint64_t)sample->timestamp_ns, state->pid, state->tid,
+               sample->agent_id, (uint64_t)sample->cgroup_id, state->path,
+               state->count,
+               (uint64_t)(sample->cpu_percent_x100 / 100),
+               (uint64_t)(sample->cpu_percent_x100 % 100),
+               policy->cpu_threshold_percent,
+               policy->failed_open_window_ms);
+        state->joint_alerted = 1;
     }
     fflush(stdout);
 }

@@ -46,9 +46,11 @@ $(SKEL): $(BPF_OBJ)
 
 # 编译并链接用户态监控程序。
 $(MONITOR): $(SRC_DIR)/monitor.c $(SRC_DIR)/detector.c \
-	$(INCLUDE_DIR)/events.h $(INCLUDE_DIR)/detector.h $(SKEL)
+	$(SRC_DIR)/resource_sampler.c $(INCLUDE_DIR)/events.h \
+	$(INCLUDE_DIR)/detector.h $(INCLUDE_DIR)/resource_sampler.h $(SKEL)
 	$(CC) $(USER_CFLAGS) $(LIBBPF_CFLAGS) \
-		$(SRC_DIR)/monitor.c $(SRC_DIR)/detector.c -o $@ $(LIBBPF_LIBS)
+		$(SRC_DIR)/monitor.c $(SRC_DIR)/detector.c \
+		$(SRC_DIR)/resource_sampler.c -o $@ $(LIBBPF_LIBS)
 
 clean:
 	rm -rf $(BUILD_DIR)

@@ -599,3 +599,197 @@ sudo bpftrace -c '/usr/bin/python3 experiments/repeated_failed_open.py' experime
 只在 count=5 时输出一条 `severity=medium rule=repeated_failed_open` 告警，字段包含相同路径、errno=2、阈值、窗口、累计时间和四项 evidence。任务退出事件齐全，用户提供命令退出状态 0。WORKLOAD 的 5 次 errno=2 和 done=1 与探针证据一致；WORKLOAD 行先于探针事件显示属于异步输出交错。
 
 因此固定路径、单 Agent、单线程场景下的计数、时间窗口和单次告警目标通过。它仍不证明逻辑死循环或资源浪费；多目标分别计数、多线程原子性、窗口边界与重置、告警冷却、正常重试误报、事件丢失、资源指标融合和正式用户态检测器尚未验证。
+
+## 正式 CPU 与重复活动联合异常（已实测通过）
+
+resource_logic_anomaly.py 在专用目录内对同一缺失文件执行 5 次打开，再持续
+约 1 秒进行 CPU 计算。正式监控器每 200 ms 读取 Agent cgroup 的 cpu.stat，
+以单核 100% 为基准计算区间 CPU 使用率。detector 保留原有
+repeated_failed_open 告警，并在相同 Agent、相同 2 秒窗口内同时满足
+CPU >= 50% 时额外输出一次 resource_logic_anomaly。
+
+运行命令见根目录 README。代码已严格编译并完成下述 sudo 端到端验证；该组合
+只是“重复无意义活动 + CPU 消耗”的受控证据，不等同于一般逻辑死循环识别。
+
+### CPU 与重复活动联合异常用户实测
+
+用户已完成正式端到端验证：Agent 1 为 cgroup 12072、PID/TID 41002。专用缺失
+路径连续 5 次返回 -ENOENT，count 1→5，第 5 次 elapsed_ns=447759，并产生一条
+medium repeated_failed_open 告警。随后首个 CPU 区间为 232420 us，累计使用
+230982 us，单核等价 99.38%，产生一条 high resource_logic_anomaly；其
+agent_id、cgroup_id、PID/TID、目标路径和 2 秒窗口与活动证据一致。
+
+后续 100.02%、99.89%、99.93% 和 60.14% 的 CPU 样本没有重复产生联合告警，
+验证了同一活动窗口只告警一次。工作负载打印 cpu_busy_done=1 和 done=1，
+PROCESS_EXIT 的 exit_code_raw=0。补充输出确认 agent_exit exit_code=0，监控器整体退出状态也为 0，因此本次
+正式端到端功能验证完整通过。退出前紧邻的强制采样形成 328 us、0% 的短区间，
+不影响告警结论，后续可作为日志降噪项处理。
+
+## 多 Agent 联合异常隔离（已实测通过）
+
+repeated_failed_open_idle.py 在解释器启动后等待 0.5 秒，再产生 5 次相同 ENOENT
+并保持空闲；cpu_busy_only.py 同样等待 0.5 秒，随后只持续占用 CPU。二者与已有
+resource_logic_anomaly.py 三组并发运行，分别构成重复活动反例、CPU 反例和联合
+正例。预期只有 Agent 3 产生 resource_logic_anomaly，运行命令见根目录 README。
+
+
+### 多 Agent 联合异常隔离用户实测
+
+三组根进程并发运行并正常退出：Agent 1 为 cgroup 12142/PID 42942，
+Agent 2 为 cgroup 12161/PID 42943，Agent 3 为 cgroup 12180/PID 42944。
+Agent 1 对专用路径 5 次 ENOENT 后产生一条 medium repeated_failed_open，
+随后 CPU 为 0.15%、0% 和 7.04%，没有联合告警。Agent 2 的 CPU 达到
+86.17% 和 99.75%，没有目标重复失败，也没有联合告警。
+
+Agent 3 在 2763672 ns 内达到 5 次失败阈值，首个关联 CPU 样本为 96.53%，
+产生唯一一条 high resource_logic_anomaly；后续 100.04% 和 99.87% 未重复告警。
+三组 PROCESS_EXIT、agent_exit 均为 0，监控器整体退出状态为 0。该结果验证本次
+三组并发受控场景中活动状态和 CPU 样本按 agent_id+cgroup_id 隔离，未发生串组；
+仍不等同于更大规模压力测试。
+
+## 固定混合工作负载性能对比（已完成首轮）
+
+performance_workload.py 依次执行固定 CPU 计算、10000 次文件打开、500 次本地
+TCP 连接和 100 个子进程，记录总耗时与分阶段耗时。run_performance_benchmark.sh
+先预热，再默认完成 5 对基线/监控运行，并由 performance_report.py 使用中位数
+计算开销百分比。完整运行方式和解释边界见根目录 README。
+
+
+### 首轮性能结果
+
+用户在 VirtualBox 环境完成 5 对配对运行。中位数结果为：总耗时从
+631.674 ms 增至 1333.965 ms，开销 111.18%；CPU 阶段 9.21%；文件阶段
+1900.00%；网络阶段 804.12%；进程阶段 62.19%。当前完整原始日志模式明显未达到
+5% 参考指标。
+
+监控输出虽重定向到 /dev/null，但每条事件仍执行 Ring Buffer 传输、用户态分派、
+字符串格式化和 printf。文件与网络高频事件的结果表明日志热路径是主要候选瓶颈；
+当前数据不能区分内核采集成本与逐事件文本输出成本。下一步应增加不格式化原始事件
+的基准模式，再使用相同工作负载拆分测量，之后才决定是否需要内核侧过滤或聚合。
+
+### 静默模式复测（已完成）
+
+监控器新增全局 --quiet-events。性能驱动已使用该参数，普通事件仍被采集、传输、
+校验并交给 detector，但跳过文本格式化与 printf。重新运行相同脚本可与首轮完整
+日志模式比较，估计逐事件日志在总开销中的占比。
+
+
+静默模式 5 对复测结果：总耗时 694.504→1639.633 ms，开销 136.09%；
+CPU 6.40%、文件 3098.88%、网络 785.74%、进程 66.62%。静默后没有改善，
+因此首轮将主要开销归因于文本格式化的假设被实测否定。文件阶段的 bpf_d_path、
+各探针的全量事件构造/Ring Buffer 提交，以及一个进程带来的多类事件放大是当前
+主要候选原因。该负载属于高事件密度微基准，不能代表真实 Agent 平均开销，但证明
+当前全量采集配置未达到 5% 参考目标。
+
+## 按事件类别隔离性能（已实测）
+
+监控器新增全局 --events process,file,network，可组合选择。未选择类别的 BPF
+程序在加载前关闭 autoload。性能驱动现在依次测试 process、file、network 和 all
+四种静默配置，每种完成 5 对相邻基线/监控运行并单独报告中位数，便于识别各类
+探针对所有工作负载阶段的影响。
+
+
+### 分类性能结果
+
+用户完成四类各 5 对配对运行。process-only 总开销 11.48%，其中 100 个子进程
+阶段 25.95%；file-only 总开销 102.07%，10000 次打开阶段 3599.13%；
+network-only 总开销 34.32%，500 次连接阶段 866.38%；all 总开销 135.43%，
+文件、网络和进程阶段分别为 2784.51%、923.57% 和 64.08%。
+
+结果明确将 file_open 真实路径全量采集定位为最大热点，其次为逐连接网络事件；
+子进程还会加载动态库并触发文件事件，因此全量模式的进程阶段存在事件放大。CPU
+及无关阶段出现负值或较大波动，反映 5 次样本与 VirtualBox 调度噪声，不能解释为
+性能提升。当前全量模式未达到 5% 参考目标，后续优化必须明确事件完整性取舍。
+
+## FILE_OPEN 每 N 次抽样性能（已完成首轮）
+
+新增全局 --file-open-sample-every N。默认 N=1 全量采集；N>1 时 BPF 在
+bpf_d_path 之前按 cgroup 确定性保留约 1/N 的 FILE_OPEN。删除和失败 openat
+仍全量，--sensitive-path 与抽样互斥。run_file_sampling_benchmark.sh 使用
+file-only 静默模式分别完成 N=1、10、100 的 5 对配对测试。
+
+
+### FILE_OPEN 抽样性能结果
+
+用户完成 N=1/10/100 各 5 对测试。N=1 总开销 126.91%，文件阶段
+3227.18%；N=10 总开销 15.87%，文件阶段 682.20%；N=100 总开销 5.94%，
+文件阶段 313.24%。N=100 将总耗时中位数从 678.162 ms 增至 718.424 ms，
+绝对增加约 40.3 ms，已经接近但仍高于 5% 参考目标。
+
+N=100 的 CPU 阶段为 12.35%，无关网络阶段为 -25.58%，说明 5 次 VirtualBox
+样本存在明显调度波动。当前不能宣称达标；应增加重复次数、报告离散程度，并在真实
+Linux 机器复测。结果同时证明在 bpf_d_path 前抽样能显著降低全量路径采集成本。
+
+## FILE_OPEN N=100 稳定性复测（已实测）
+
+run_file_sampling_stability.sh 固定 N=100，完成 15 对相邻基线/监控样本。
+performance_report.py 已增加配对开销中位数及 p25/p75，减少两组独立中位数受
+虚拟机时间漂移影响的问题。
+
+
+15 对复测结果：总耗时中位数 703.902→768.113 ms，两组中位数开销 9.12%；
+逐对开销中位数 8.74%，p25/p75 为 4.60%/12.60%。文件阶段逐对开销中位数
+253.55%，p25/p75 为 231.27%/345.45%。因此先前 5 对得到的 5.94% 偏乐观，
+N=100 在当前实现和虚拟机中不能宣称达到 5%。
+
+CPU、网络等无关阶段仍有跨零的大幅波动，但总开销区间的稳定中心高于 5%。
+当前每次 FILE_OPEN 即使未被采样保留，也会额外查询 file_open_counts map；
+下一优化候选是把采样计数并入已有 cgroup 归属 map，去掉第二次 map 查询。
+
+### FILE_OPEN 采样 map 合并（待实机复测）
+
+`agent_by_cgroup` 的 value 已由单个 agent_id 扩展为 agent_context，同时保存
+agent_id 和 file_open_count。FILE_OPEN 用已有归属查询结果完成原子计数与抽样，
+独立 file_open_counts map 已删除；N=1/100 的外部语义不变。严格构建、Python
+语法、shell 语法与 git diff --check 已通过。BPF verifier 加载和 15 对性能结果
+仍待 sudo 实测，不能提前认定开销下降或达到 5%。
+
+### FILE_OPEN 采样 map 合并复测结果
+
+用户完成合并后的 N=100、15 对稳定性复测。两组中位数总开销为 7.29%，逐对
+开销中位数为 8.08%，p25/p75 为 6.02%/15.29%；文件阶段逐对中位数为
+294.00%，p25/p75 为 239.19%/357.29%。相比合并前的总开销逐对中位数
+8.74%，中心值只下降 0.66 个百分点，而 p75 从 12.60% 上升至 15.29%，
+文件阶段中心值也未改善。该优化已通过 verifier 和端到端运行，但一次额外 map
+查询不是主要瓶颈，差异不足以从 VirtualBox 波动中稳定区分，仍未达到 5%。
+
+## 真实 Codex Agent + 百炼 Qwen（直连已通过，受控网络待复测）
+
+新增 run_bailian_codex.sh，使用本机 Codex CLI 0.155.1 作为 Agent harness，
+通过独立命令行配置将 qwen3.8-max-0902 指向百炼 Responses API。脚本使用
+--ignore-user-config 和 --ephemeral，API Key 只从 BAILIAN_API_KEY
+环境变量读取，避免修改现有 ChatGPT/Codex Pro 配置或将密钥写入仓库。
+BAILIAN_BASE_URL 必须是控制台提供的 HTTPS compatible-mode/v1 API Host。
+
+shell 语法、缺少密钥时的拒绝路径和 git diff --check 已通过。尚未发起模型请求，
+因此 provider、模型 ID、免费额度扣减和受控启动下的 Agent 事件仍待用户实测。
+
+- 首次直连出现 qwen3.8-max-0902 缺少本地 metadata 的警告，Codex 会退回通用
+  元数据。已新增 bailian-model-catalog.json，并让启动脚本通过
+  model_catalog_json 显式加载；字段按百炼官方 qwen3.8-max 示例配置并映射到
+  用户实际模型 ID。JSON、shell 语法和 git diff --check 已通过，待用户复跑确认
+  warning 消失并取得 BAILIAN_OK。
+
+- 用户首次直连复跑成功：Codex 0.155.1 显示 model=qwen3.8-max-0902、
+  provider=bailian、reasoning effort=low，未再出现 metadata fallback；模型只回复
+  BAILIAN_OK，tokens used=44,877，退出状态 0。该结果验证百炼 Responses API
+  和本地 metadata 配置可用。仓库 AGENTS.md 当前约 55 KB，自动上下文是简单
+  请求 token 较高的主要候选；后续真实 Agent 实验应使用独立小工作目录。
+
+
+- 首次受控启动使用独立 /tmp 工作目录时，进程采集与归属成功：根 PID 99752
+  以及 Codex 的线程、lsb_release/getconf 辅助进程均保持 agent_id=1、
+  cgroup_id=18468、uid=1000，证明真实多线程 Agent 及其后代可由 cgroup 统一归属。
+  Codex 随后因该目录不是受信任 Git 仓库而在请求模型前退出，提示需要
+  --skip-git-repo-check；因此本轮没有 CONNECT_RESULT，Agent exit_code=1，整体状态 1。
+  启动脚本现已固定加入该选项，待按相同命令复跑网络与模型响应。
+
+
+- 加入 --skip-git-repo-check 后，真实 Codex Agent 受控复测完整通过：根 PID 101701、
+  agent_id=1、cgroup_id=18538、uid=1000；Codex 输出 MONITORED_AGENT_OK，
+  tokens used=1,433，Agent exit_code 和整体命令状态均为 0。捕获两条到 443 端口的
+  CONNECT_RESULT，目标分别为 198.18.0.53 和 198.18.0.36，ret=-115 表示非阻塞
+  connect 的 EINPROGRESS，不代表最终连接失败；模型成功响应证明异步连接随后完成。
+  198.18.0.0/15 在当前虚拟机/代理环境中可能是合成或转发地址，不将其宣称为百炼
+  服务的真实公网 IP。Codex 的线程及 lsb_release/getconf 辅助进程始终保持相同
+  agent_id/cgroup_id，真实 Agent 的进程与网络归属链路已在该受控场景验证。

@@ -9,6 +9,8 @@
 
 char LICENSE[] SEC("license") = "GPL";
 
+const volatile __u32 file_open_sample_every = 1;
+
 /* 内核态通过 Ring Buffer 把事件发送给用户态。 */
 struct {
     __uint(type, BPF_MAP_TYPE_RINGBUF);
@@ -20,7 +22,7 @@ struct {
     __uint(type, BPF_MAP_TYPE_HASH);
     __uint(max_entries, 128);
     __type(key, __u64);
-    __type(value, __u32);
+    __type(value, struct agent_context);
 } agent_by_cgroup SEC(".maps");
 
 #define MONITOR_AF_INET 2
@@ -63,15 +65,15 @@ int handle_execve(struct trace_event_raw_sys_enter *ctx)
 {
     struct exec_event *event;
     struct task_struct *task;
-    __u32 *agent_id;
+    struct agent_context *agent;
     __u64 cgroup_id;
     const char *filename;
     __u64 pid_tgid;
     __u64 uid_gid;
 
     cgroup_id = bpf_get_current_cgroup_id();
-    agent_id = bpf_map_lookup_elem(&agent_by_cgroup, &cgroup_id);
-    if (!agent_id)
+    agent = bpf_map_lookup_elem(&agent_by_cgroup, &cgroup_id);
+    if (!agent)
         return 0;
 
     /* 直接在 Ring Buffer 中申请空间，失败时丢弃本条事件。 */
@@ -93,7 +95,7 @@ int handle_execve(struct trace_event_raw_sys_enter *ctx)
     event->header.tid = (__u32)pid_tgid;
     event->header.ppid = BPF_CORE_READ(task, real_parent, tgid);
     event->header.uid = (__u32)uid_gid;
-    event->header.agent_id = *agent_id;
+    event->header.agent_id = agent->agent_id;
     bpf_get_current_comm(event->header.comm, sizeof(event->header.comm));
 
     /* execve 的第一个参数是用户态 filename 指针。 */
@@ -112,14 +114,14 @@ int handle_process_fork(struct trace_event_raw_sched_process_fork *ctx)
 {
     struct process_fork_event *event;
     struct task_struct *task;
-    __u32 *agent_id;
+    struct agent_context *agent;
     __u64 cgroup_id;
     __u64 pid_tgid;
     __u64 uid_gid;
 
     cgroup_id = bpf_get_current_cgroup_id();
-    agent_id = bpf_map_lookup_elem(&agent_by_cgroup, &cgroup_id);
-    if (!agent_id)
+    agent = bpf_map_lookup_elem(&agent_by_cgroup, &cgroup_id);
+    if (!agent)
         return 0;
 
     event = bpf_ringbuf_reserve(&events, sizeof(*event), 0);
@@ -139,7 +141,7 @@ int handle_process_fork(struct trace_event_raw_sched_process_fork *ctx)
     event->header.tid = (__u32)pid_tgid;
     event->header.ppid = BPF_CORE_READ(task, real_parent, tgid);
     event->header.uid = (__u32)uid_gid;
-    event->header.agent_id = *agent_id;
+    event->header.agent_id = agent->agent_id;
     bpf_get_current_comm(event->header.comm, sizeof(event->header.comm));
 
     event->payload.parent_pid = ctx->parent_pid;
@@ -157,15 +159,15 @@ int handle_process_exit(struct trace_event_raw_sched_process_template *ctx)
 {
     struct process_exit_event *event;
     struct task_struct *task;
-    __u32 *agent_id;
+    struct agent_context *agent;
     __u64 cgroup_id;
     __u64 pid_tgid;
     __u64 uid_gid;
 
     (void)ctx;
     cgroup_id = bpf_get_current_cgroup_id();
-    agent_id = bpf_map_lookup_elem(&agent_by_cgroup, &cgroup_id);
-    if (!agent_id)
+    agent = bpf_map_lookup_elem(&agent_by_cgroup, &cgroup_id);
+    if (!agent)
         return 0;
 
     event = bpf_ringbuf_reserve(&events, sizeof(*event), 0);
@@ -185,7 +187,7 @@ int handle_process_exit(struct trace_event_raw_sched_process_template *ctx)
     event->header.tid = (__u32)pid_tgid;
     event->header.ppid = BPF_CORE_READ(task, real_parent, tgid);
     event->header.uid = (__u32)uid_gid;
-    event->header.agent_id = *agent_id;
+    event->header.agent_id = agent->agent_id;
     bpf_get_current_comm(event->header.comm, sizeof(event->header.comm));
     event->payload.exit_code_raw = BPF_CORE_READ(task, exit_code);
 
@@ -199,7 +201,7 @@ int BPF_PROG(handle_file_open, struct file *file, int ret)
 {
     struct file_open_event *event;
     struct task_struct *task;
-    __u32 *agent_id;
+    struct agent_context *agent;
     __u64 cgroup_id;
     __u64 pid_tgid;
     __u64 uid_gid;
@@ -210,9 +212,17 @@ int BPF_PROG(handle_file_open, struct file *file, int ret)
         return ret;
 
     cgroup_id = bpf_get_current_cgroup_id();
-    agent_id = bpf_map_lookup_elem(&agent_by_cgroup, &cgroup_id);
-    if (!agent_id)
+    agent = bpf_map_lookup_elem(&agent_by_cgroup, &cgroup_id);
+    if (!agent)
         return 0;
+
+    if (file_open_sample_every > 1) {
+        __u64 sequence;
+
+        sequence = __sync_fetch_and_add(&agent->file_open_count, 1);
+        if (sequence % file_open_sample_every)
+            return 0;
+    }
 
     event = bpf_ringbuf_reserve(&events, sizeof(*event), 0);
     if (!event)
@@ -231,7 +241,7 @@ int BPF_PROG(handle_file_open, struct file *file, int ret)
     event->header.tid = (__u32)pid_tgid;
     event->header.ppid = BPF_CORE_READ(task, real_parent, tgid);
     event->header.uid = (__u32)uid_gid;
-    event->header.agent_id = *agent_id;
+    event->header.agent_id = agent->agent_id;
     bpf_get_current_comm(event->header.comm, sizeof(event->header.comm));
 
     event->payload.flags = BPF_CORE_READ(file, f_flags);
@@ -249,7 +259,7 @@ int BPF_PROG(handle_path_unlink, const struct path *dir,
 {
     struct file_unlink_event *event;
     struct task_struct *task;
-    __u32 *agent_id;
+    struct agent_context *agent;
     __u64 cgroup_id;
     __u64 pid_tgid;
     __u64 uid_gid;
@@ -261,8 +271,8 @@ int BPF_PROG(handle_path_unlink, const struct path *dir,
         return ret;
 
     cgroup_id = bpf_get_current_cgroup_id();
-    agent_id = bpf_map_lookup_elem(&agent_by_cgroup, &cgroup_id);
-    if (!agent_id)
+    agent = bpf_map_lookup_elem(&agent_by_cgroup, &cgroup_id);
+    if (!agent)
         return 0;
 
     event = bpf_ringbuf_reserve(&events, sizeof(*event), 0);
@@ -282,7 +292,7 @@ int BPF_PROG(handle_path_unlink, const struct path *dir,
     event->header.tid = (__u32)pid_tgid;
     event->header.ppid = BPF_CORE_READ(task, real_parent, tgid);
     event->header.uid = (__u32)uid_gid;
-    event->header.agent_id = *agent_id;
+    event->header.agent_id = agent->agent_id;
     bpf_get_current_comm(event->header.comm, sizeof(event->header.comm));
 
     path_ret = bpf_d_path((struct path *)dir, event->payload.dir_path,
@@ -304,12 +314,12 @@ int handle_openat_enter(struct trace_event_raw_sys_enter *ctx)
 {
     struct pending_openat pending = {};
     const char *filename;
-    __u32 *agent_id;
+    struct agent_context *agent;
     __u64 pid_tgid;
 
     pending.cgroup_id = bpf_get_current_cgroup_id();
-    agent_id = bpf_map_lookup_elem(&agent_by_cgroup, &pending.cgroup_id);
-    if (!agent_id)
+    agent = bpf_map_lookup_elem(&agent_by_cgroup, &pending.cgroup_id);
+    if (!agent)
         return 0;
 
     filename = (const char *)ctx->args[1];
@@ -319,7 +329,7 @@ int handle_openat_enter(struct trace_event_raw_sys_enter *ctx)
                                 filename) < 0)
         return 0;
 
-    pending.agent_id = *agent_id;
+    pending.agent_id = agent->agent_id;
     pending.dirfd = (__s32)ctx->args[0];
     pid_tgid = bpf_get_current_pid_tgid();
     bpf_map_update_elem(&pending_openats, &pid_tgid, &pending, BPF_ANY);
@@ -379,13 +389,13 @@ int handle_connect_enter(struct trace_event_raw_sys_enter *ctx)
 {
     struct pending_connect pending = {};
     struct sockaddr *user_address;
-    __u32 *agent_id;
+    struct agent_context *agent;
     __u64 pid_tgid;
     __u16 family;
 
     pending.cgroup_id = bpf_get_current_cgroup_id();
-    agent_id = bpf_map_lookup_elem(&agent_by_cgroup, &pending.cgroup_id);
-    if (!agent_id)
+    agent = bpf_map_lookup_elem(&agent_by_cgroup, &pending.cgroup_id);
+    if (!agent)
         return 0;
 
     user_address = (struct sockaddr *)ctx->args[1];
@@ -395,7 +405,7 @@ int handle_connect_enter(struct trace_event_raw_sys_enter *ctx)
                             &user_address->sa_family) < 0)
         return 0;
 
-    pending.agent_id = *agent_id;
+    pending.agent_id = agent->agent_id;
     pending.socket_fd = (__s32)ctx->args[0];
     pending.family = family;
 

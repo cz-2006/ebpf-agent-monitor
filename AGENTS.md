@@ -444,3 +444,199 @@ HTTPS 明文采集是后期研究方向。OpenSSL 的 SSL_read/SSL_write 仅是�
 - 阶段提交前重新运行 make、全部 experiments Python 语法检查和 git diff --check，
   均通过。下一步已由用户确定：加入 cgroup CPU 使用增量，并与重复活动证据联合，
   形成资源/逻辑异常判断；开始前仍按共同设计模式确认采样周期、阈值及告警语义。
+
+## cgroup CPU 采样与资源/逻辑联合异常（2026-09-21）
+
+- 用户确认 CPU 数据源采用用户态周期读取每个 Agent cgroup 的 cpu.stat；
+  使用单核等价值，100% 表示占满一个 CPU 核，允许多线程任务超过 100%。
+- 用户确认保留独立 repeated_failed_open 告警，并额外输出 CPU 高占用与重复失败
+  活动的联合异常；模块采用独立 resource_sampler.c/.h，detector 只接收区间样本
+  并做关联。
+- 已实现每 Agent 成对参数 --cpu-sample-ms 与 --cpu-threshold-percent。采样器在
+  Agent 放行前建立 usage_usec 基线，运行中周期采样，根进程退出时强制采最后一次；
+  采样失败输出 resource_sample_error，不伪造零值。
+- detector 在同一 Agent、repeated_failed_open 时间窗内达到活动阈值且 CPU 达到
+  阈值时，只输出一次 high、rule=resource_logic_anomaly，保留原 medium 告警。
+  新增 experiments/resource_logic_anomaly.py：5 次 ENOENT 后持续约 1 秒 CPU 计算。
+- make 严格构建、全部 Python 语法检查、工作负载单独运行和 git diff --check
+  均通过；后续用户 sudo 端到端验证也已通过，具体数据见下一条。
+
+- CPU 联合异常已由用户 sudo 实测通过：Agent 1 为 cgroup 12072、PID/TID 41002；
+  专用路径 5 次 ENOENT 在 447759 ns 内达到阈值并保留一条 medium 告警，首个 CPU
+  样本为 99.38% 并产生唯一一条 high resource_logic_anomaly。后续多个高 CPU
+  样本未重复联合告警，工作负载完成且 PROCESS_EXIT exit_code_raw=0；补充输出确认
+  agent_exit exit_code=0、监控器整体状态 0。本次正式端到端验证完整通过。退出前的
+  强制采样形成 328 us、0% 短区间，不影响告警结论，后续可考虑日志降噪。
+
+## 多 Agent 联合异常隔离验证（2026-09-21，已实测通过）
+
+- 用户选择下一步验证多 Agent 联合异常隔离。已设计三组并发对照：Agent 1 只在
+  启动 CPU 区间结束后产生 5 次同目标 ENOENT 并保持空闲；Agent 2 只持续占用
+  CPU；Agent 3 使用已有联合正例，同时产生重复失败和高 CPU。
+- 三组配置相同的 5 次/2 秒、200 ms CPU 采样和 50% 阈值。预期 Agent 1 只有
+  repeated_failed_open，Agent 2 只有高 CPU 样本，只有 Agent 3 产生唯一一条
+  resource_logic_anomaly。该设计用于检查不同 Agent 的两半证据不会串联。
+- 新增 experiments/repeated_failed_open_idle.py 和 cpu_busy_only.py。make、
+  全部 Python 语法检查、两个新工作负载单独运行及 git diff --check 均通过；
+  三 Agent 正式链路仍待用户 sudo 验证。
+
+
+- 三 Agent sudo 端到端验证通过：Agent 1（cgroup 12142/PID 42942）只有
+  repeated_failed_open，后续 CPU 最高 7.04%；Agent 2（cgroup 12161/PID 42943）
+  只有 86.17%/99.75% 高 CPU；二者均无联合告警。Agent 3（cgroup 12180/PID
+  42944）在 5 次失败后以 96.53% CPU 产生唯一一条 resource_logic_anomaly，
+  后续高 CPU 未重复告警。三组及监控器整体退出状态均为 0。本次受控并发场景
+  验证 agent_id+cgroup_id 双条件隔离有效，尚不是更大规模压力测试。
+
+## 初步固定工作负载性能对比（2026-09-21，已完成首轮）
+
+- 用户选择先做固定工作负载的前后对比。新增 performance_workload.py，业务计时
+  覆盖固定 CPU 计算、10000 次 /dev/null 打开、500 次本地 TCP 连接和 100 个
+  true 子进程，并报告总耗时及分阶段耗时。
+- 新增 run_performance_benchmark.sh：先预热，再交替执行 5 对无监控/有监控运行；
+  监控输出重定向至 /dev/null，排除终端渲染，但 Ring Buffer 消费和事件格式化仍
+  计入。performance_report.py 使用两组中位数计算开销百分比。
+- make、Python 语法检查、shell 语法检查、报告器合成数据测试和工作负载单独运行
+  均通过。一次无监控烟雾测试总耗时约 831 ms，不作为性能结论。正式配对结果待
+  用户运行；VirtualBox 数据只作开发期初测，不能直接宣称达到赛题 5% 指标。
+
+
+- 用户完成 5 对性能测试：总耗时中位数 631.674→1333.965 ms，开销 111.18%；
+  CPU 9.21%、文件 1900.00%、网络 804.12%、进程 62.19%。完整原始日志模式明显
+  未达到 5% 参考指标。重定向 /dev/null 仍保留事件格式化和 printf，因此当前结果
+  混合了内核采集、Ring Buffer、用户态分派与逐事件文本输出成本；下一步应先增加
+  静默原始事件基准模式，用相同负载拆分采集与日志成本，不能据此直接断定 eBPF
+  探针本身具有同等开销。
+
+## 静默原始事件性能模式（2026-09-21，已复测）
+
+- 用户选择先拆分采集与日志成本。新增全局 --quiet-events，必须放在第一个
+  --agent 前；eBPF、Ring Buffer、事件尺寸校验和 detector 调用保持不变，只跳过
+  普通 EXEC/FORK/EXIT/FILE/CONNECT 事件的格式化与打印。register、agent_exit、
+  资源样本和告警仍输出，默认模式行为不变。
+- 性能驱动脚本已在监控组启用静默模式。make 严格构建、Python/shell 语法检查和
+  git diff --check 通过；相同 5 对工作负载的静默复测待用户运行。
+
+
+- 用户完成静默模式 5 对复测：总开销 136.09%，CPU 6.40%、文件 3098.88%、
+  网络 785.74%、进程 66.62%，没有比完整日志模式改善。此前“文本格式化是主要
+  瓶颈”的推断被实测否定。主要候选转为 file_open 的 bpf_d_path、全量事件构造/
+  Ring Buffer 提交，以及子进程触发多类事件放大。该高事件密度微基准证明当前
+  全量采集未达到 5%，但不能外推真实 Agent 平均开销；下一步需按事件类别隔离
+  测量，再决定内核过滤、采样或按需启用策略。
+
+## 按事件类别隔离性能（2026-09-21，已实测）
+
+- 用户选择增加事件类别开关定位探针成本。新增全局 --events LIST，支持逗号分隔的
+  process、file、network，默认全开；必须位于第一个 --agent 前。用户态在 BPF
+  load 前对未选择类别的程序设置 autoload=false，因此不会附着对应 hook。
+- process 包含 exec/fork/exit，file 包含 LSM open/unlink 和失败 openat 配对，
+  network 包含 connect 入口/返回配对。关闭类别会同时移除依赖其证据的规则能力。
+- 性能驱动扩展为 process、file、network、all 四组，每组 5 对相邻基线/监控样本，
+  均使用 --quiet-events。make 严格构建、Python/shell 语法及 git diff --check
+  通过；合法参数已进入权限检查，非法类别返回用法错误。正式分类数据待用户运行。
+
+
+- 分类性能实测：process-only 总开销 11.48%、进程阶段 25.95%；file-only 总开销
+  102.07%、文件阶段 3599.13%；network-only 总开销 34.32%、网络阶段 866.38%；
+  all 总开销 135.43%，文件/网络/进程阶段分别 2784.51%/923.57%/64.08%。
+  file_open 真实路径全量采集是最大热点，逐连接网络事件次之；子进程加载库会触发
+  文件事件，形成跨类别放大。负开销和无关阶段波动视为 5 次样本及 VirtualBox
+  调度噪声，不宣称性能提升。当前全量模式未达到 5%，优化需明确完整性取舍。
+
+## FILE_OPEN 双模式与确定性抽样（2026-09-21，已完成首轮性能实测）
+
+- 用户确认保留默认全量真实路径模式，并增加低开销“每 N 次保留一次”模式。新增
+  全局 --file-open-sample-every N，默认 1；BPF 用 cgroup 键的 LRU 计数表，
+  第 1 次及之后每隔 N 次在 bpf_d_path/Ring Buffer 之前放行。
+- 抽样只影响成功 FILE_OPEN；FILE_UNLINK、失败 openat、进程和网络保持全量。
+  N>1 与任何 Agent 的 --sensitive-path 互斥，参数解析阶段拒绝，避免漏掉敏感
+  访问告警。完整审计继续使用 N=1。
+- 新增 run_file_sampling_benchmark.sh，在 file-only 静默模式比较 N=1/10/100，
+  每档 5 对。BPF/用户态严格构建、Python/shell 语法、冲突与合法参数解析及
+  git diff --check 均通过；内核加载、抽样事件数量和性能仍待用户 sudo 实测。
+
+
+- FILE_OPEN 抽样 5 对实测：N=1 总开销 126.91%、文件 3227.18%；N=10 总开销
+  15.87%、文件 682.20%；N=100 总开销 5.94%、文件 313.24%。N=100 总耗时
+  中位数 678.162→718.424 ms，绝对增加约 40.3 ms，接近但仍未达到 5%。
+  CPU 12.35% 与无关网络 -25.58% 表明 5 次 VirtualBox 样本噪声明显，不能宣称
+  达标；需增加重复次数、离散度报告并在真实 Linux 机器复测。抽样在昂贵路径解析
+  前生效的性能收益已得到验证。
+
+## FILE_OPEN N=100 稳定性复测（2026-09-21，已实测）
+
+- 用户选择先提高 N=100 测量可信度。新增 run_file_sampling_stability.sh，
+  固定 file-only、quiet、N=100，预热后运行 15 对相邻基线/监控样本。
+- performance_report.py 保留两组中位数开销，并新增逐对开销的中位数和
+  p25/p75 四分位区间，用于观察虚拟机调度波动。正式数据待用户运行。
+
+
+- N=100 的 15 对稳定性结果：两组中位数总开销 9.12%，逐对中位数 8.74%，
+  p25/p75 为 4.60%/12.60%；文件阶段逐对中位数 253.55%，p25/p75 为
+  231.27%/345.45%。先前 5 对的 5.94% 偏乐观，当前不能宣称达到 5%。
+  未保留的每次 FILE_OPEN 仍额外查询 file_open_counts map；可在不提高抽样 N
+  的前提下，把计数并入已有 cgroup 归属 map，去掉第二次 map 查询后再测。
+
+## FILE_OPEN 采样 map 合并（2026-09-21，待实机复测）
+
+- 用户选择在保持 N=100 确定性抽样语义的前提下，先减少一次 BPF map 查询。
+  agent_by_cgroup 的 value 已由 __u32 agent_id 扩展为 agent_context，包含
+  agent_id 与 file_open_count；FILE_OPEN 复用归属查询结果并原子递增计数，
+  独立 file_open_counts map 已删除。其他事件仍读取同一结构中的 agent_id。
+- make 严格构建、Python 语法、性能脚本 shell 语法和 git diff --check 均通过。
+  尚需用户 sudo 加载验证 verifier，再重跑 15 对 N=100 稳定性测试。当前不得
+  宣称该优化降低了实测开销或已达到 5%。
+
+- 用户已完成 map 合并后的 N=100、15 对复测，证明新结构通过 verifier 并可正常
+  端到端运行。总开销两组中位数为 7.29%，逐对中位数 8.08%，p25/p75 为
+  6.02%/15.29%；文件阶段逐对中位数 294.00%，p25/p75 为
+  239.19%/357.29%。与合并前总开销逐对中位数 8.74% 相比仅下降 0.66 个
+  百分点，p75 反而由 12.60% 升至 15.29%，文件阶段也未改善。结论是额外一次
+  map 查询不是主要瓶颈，变化被 VirtualBox 波动覆盖，当前仍不能宣称达到 5%。
+
+## 真实 Agent 接入方案（2026-09-21，已确认总体方向）
+
+- 用户决定继续使用开源 Codex CLI 作为本地 Agent harness，将模型后端替换为
+  阿里云百炼的 Qwen；目标是由 Codex 负责上下文、工具调用和本地执行，模型请求
+  与 token 消耗走百炼，不使用 ChatGPT/Codex Pro 模型额度。
+- 本机 Codex CLI 实测版本为 0.155.1。该新版需要 Responses API；百炼官方文档
+  明确给出 qwen3.8-max 的新版 Codex/Responses 配置，而用户额度列表中的
+  qwen3.7-flash-2026-07-15 是否支持 Responses 尚未确认。下一步先选定兼容模型，
+  再采用不覆盖现有 OpenAI 登录配置、不把 API Key 写入仓库的独立启动配置。
+
+- 用户选择 qwen3.8-max-0902 作为首个百炼后端。已新增
+  experiments/run_bailian_codex.sh：Codex CLI 0.155.1 使用 Responses API，
+  通过 --ignore-user-config 与 --ephemeral 隔离现有 Pro 配置，默认 low 推理，
+  API Key 和业务空间 API Host 分别只从 BAILIAN_API_KEY、BAILIAN_BASE_URL
+  读取。脚本不保存密钥，语法、缺少密钥拒绝路径和 git diff --check 已通过；
+  首次直连和 sudo 受控启动仍待用户执行。
+
+- 百炼首次直连报告 qwen3.8-max-0902 缺少模型 metadata、使用 fallback。已新增
+  experiments/bailian-model-catalog.json，并在启动脚本中显式设置
+  model_catalog_json；元数据依据百炼官方 qwen3.8-max 示例映射到带日期模型 ID。
+  JSON 与 shell 语法通过，待复跑确认连接结果。
+
+- 百炼 Qwen 首次直连已由用户验证通过：Codex 0.155.1 输出
+  model=qwen3.8-max-0902、provider=bailian、low，回复 BAILIAN_OK，使用
+  44,877 tokens，退出状态 0，且 metadata fallback 警告已消失。AGENTS.md
+  实测约 55 KB，是简单请求仍消耗较多上下文的主要候选。受控监控验证尚未进行；
+  脚本增加 $HOME/.local/bin/codex fallback，以适配 sudo secure_path。
+
+
+- 百炼真实 Codex Agent 首次受控启动完成了进程侧验证：根 PID 99752 及 Codex
+  创建的线程和 lsb_release/getconf 辅助进程全部保持 agent_id=1、
+  cgroup_id=18468、uid=1000，cgroup 对真实多线程 Agent 的归属链路有效。
+  由于测试工作目录位于非 Git 的 /tmp，Codex 在模型请求前以
+  `Not inside a trusted directory` 退出，本轮无网络事件，Agent 和监控命令状态均为 1。
+  run_bailian_codex.sh 已固定加入 --skip-git-repo-check，待原命令复跑确认
+  CONNECT_RESULT、MONITORED_AGENT_OK 和退出状态 0。
+
+
+- 修复 Git 工作目录检查后，百炼真实 Codex Agent 受控端到端复测通过：根 PID
+  101701、agent_id=1、cgroup_id=18538、uid=1000；输出 MONITORED_AGENT_OK，
+  tokens used=1,433，Agent 与监控命令退出状态均为 0。观测到同组线程对
+  198.18.0.53:443 和 198.18.0.36:443 的 CONNECT_RESULT，ret=-115 是非阻塞
+  connect 的 EINPROGRESS，成功模型响应证明连接随后异步完成；该网段可能由当前
+  代理/虚拟网络合成，不视为百炼真实公网 IP。真实 Agent 的进程、后代、线程和
+  网络事件 cgroup 归属已在该受控场景验证。

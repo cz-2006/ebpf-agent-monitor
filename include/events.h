@@ -19,6 +19,13 @@ enum event_type {
     EVENT_FILE_OPEN_RESULT = 7, /* 当前只提交失败的 openat 返回结果。 */
 };
 
+/* cgroup 归属与 FILE_OPEN 抽样共用的 Agent 状态。 */
+struct agent_context {
+    __u32 agent_id;
+    __u32 reserved;
+    __u64 file_open_count;
+};
+
 /* 所有事件都以公共头开始，用户态据此校验长度并按类型分派。 */
 struct monitor_event_header {
     __u64 timestamp_ns; /* 内核单调时钟。 */

@@ -22,7 +22,14 @@
 
 #define CGROUP_BASE "/sys/fs/cgroup/ebpf-agent-monitor"
 #define MAX_AGENTS 16
+#define EVENT_MASK_PROCESS (1U << 0)
+#define EVENT_MASK_FILE (1U << 1)
+#define EVENT_MASK_NETWORK (1U << 2)
+#define EVENT_MASK_ALL (EVENT_MASK_PROCESS | EVENT_MASK_FILE | EVENT_MASK_NETWORK)
 static volatile sig_atomic_t stop;
+static int quiet_events;
+static unsigned int event_mask = EVENT_MASK_ALL;
+static __u32 file_open_sample_every = 1;
 
 struct run_identity {
     uid_t uid;
@@ -48,9 +55,17 @@ struct agent_process {
     const char *workspace_path;
     __u32 failed_open_threshold;
     __u32 failed_open_window_ms;
+    __u32 cpu_sample_ms;
+    __u32 cpu_threshold_percent;
 };
 
 static void on_signal(int sig) { (void)sig; stop = 1; }
+
+static void on_resource_sample(void *context,
+                               const struct resource_cpu_sample *sample)
+{
+    detector_process_cpu_sample(context, sample);
+}
 
 static void print_header(const struct monitor_event_header *h,
                          const char *event_name)
@@ -76,10 +91,12 @@ static int on_event(void *ctx, void *data, size_t size)
         const struct exec_event *event = data;
         if (size != sizeof(*event))
             break;
-        print_header(h, "EXEC_ATTEMPT");
-        printf(" filename=%.*s\n", EVENT_FILENAME_LEN,
-               event->payload.filename);
-        fflush(stdout);
+        if (!quiet_events) {
+            print_header(h, "EXEC_ATTEMPT");
+            printf(" filename=%.*s\n", EVENT_FILENAME_LEN,
+                   event->payload.filename);
+            fflush(stdout);
+        }
         detector_process(detector, data, size);
         return 0;
     }
@@ -87,31 +104,37 @@ static int on_event(void *ctx, void *data, size_t size)
         const struct process_fork_event *event = data;
         if (size != sizeof(*event))
             break;
-        print_header(h, "PROCESS_FORK");
-        printf(" parent_pid=%u child_pid=%u child_comm=%.*s\n",
-               event->payload.parent_pid, event->payload.child_pid,
-               EVENT_COMM_LEN, event->payload.child_comm);
-        fflush(stdout);
+        if (!quiet_events) {
+            print_header(h, "PROCESS_FORK");
+            printf(" parent_pid=%u child_pid=%u child_comm=%.*s\n",
+                   event->payload.parent_pid, event->payload.child_pid,
+                   EVENT_COMM_LEN, event->payload.child_comm);
+            fflush(stdout);
+        }
         return 0;
     }
     case EVENT_PROCESS_EXIT: {
         const struct process_exit_event *event = data;
         if (size != sizeof(*event))
             break;
-        print_header(h, "PROCESS_EXIT");
-        printf(" exit_code_raw=%d\n", event->payload.exit_code_raw);
-        fflush(stdout);
+        if (!quiet_events) {
+            print_header(h, "PROCESS_EXIT");
+            printf(" exit_code_raw=%d\n", event->payload.exit_code_raw);
+            fflush(stdout);
+        }
         return 0;
     }
     case EVENT_FILE_OPEN: {
         const struct file_open_event *event = data;
         if (size != sizeof(*event))
             break;
-        print_header(h, "FILE_OPEN");
-        printf(" path=%.*s flags=%u path_ret=%d\n",
-               EVENT_FILENAME_LEN, event->payload.path,
-               event->payload.flags, event->payload.path_ret);
-        fflush(stdout);
+        if (!quiet_events) {
+            print_header(h, "FILE_OPEN");
+            printf(" path=%.*s flags=%u path_ret=%d\n",
+                   EVENT_FILENAME_LEN, event->payload.path,
+                   event->payload.flags, event->payload.path_ret);
+            fflush(stdout);
+        }
         detector_process(detector, data, size);
         return 0;
     }
@@ -121,14 +144,17 @@ static int on_event(void *ctx, void *data, size_t size)
             break;
         size_t dir_len;
 
-        print_header(h, "FILE_UNLINK_ATTEMPT");
-        dir_len = strnlen(event->payload.dir_path, EVENT_FILENAME_LEN);
-        printf(" path=%.*s%s%.*s path_ret=%d name_ret=%d\n",
-               EVENT_FILENAME_LEN, event->payload.dir_path,
-               dir_len && event->payload.dir_path[dir_len - 1] == '/' ? "" : "/",
-               EVENT_FILENAME_LEN, event->payload.name,
-               event->payload.path_ret, event->payload.name_ret);
-        fflush(stdout);
+        if (!quiet_events) {
+            print_header(h, "FILE_UNLINK_ATTEMPT");
+            dir_len = strnlen(event->payload.dir_path, EVENT_FILENAME_LEN);
+            printf(" path=%.*s%s%.*s path_ret=%d name_ret=%d\n",
+                   EVENT_FILENAME_LEN, event->payload.dir_path,
+                   dir_len && event->payload.dir_path[dir_len - 1] == '/'
+                       ? "" : "/",
+                   EVENT_FILENAME_LEN, event->payload.name,
+                   event->payload.path_ret, event->payload.name_ret);
+            fflush(stdout);
+        }
         detector_process(detector, data, size);
         return 0;
     }
@@ -137,12 +163,14 @@ static int on_event(void *ctx, void *data, size_t size)
 
         if (size != sizeof(*event))
             break;
-        print_header(h, "FILE_OPEN_RESULT");
-        printf(" dirfd=%d attempted_path=%.*s ret=%d"
-               " path_basis=syscall_input\n",
-               event->payload.dirfd, EVENT_FILENAME_LEN,
-               event->payload.attempted_path, event->payload.ret);
-        fflush(stdout);
+        if (!quiet_events) {
+            print_header(h, "FILE_OPEN_RESULT");
+            printf(" dirfd=%d attempted_path=%.*s ret=%d"
+                   " path_basis=syscall_input\n",
+                   event->payload.dirfd, EVENT_FILENAME_LEN,
+                   event->payload.attempted_path, event->payload.ret);
+            fflush(stdout);
+        }
         detector_process(detector, data, size);
         return 0;
     }
@@ -153,17 +181,19 @@ static int on_event(void *ctx, void *data, size_t size)
 
         if (size != sizeof(*event))
             break;
-        address_family = event->payload.family == AF_INET ? AF_INET :
-                         event->payload.family == AF_INET6 ? AF_INET6 : 0;
-        if (address_family)
-            (void)inet_ntop(address_family, event->payload.destination_address,
-                            address, sizeof(address));
-
-        print_header(h, "CONNECT_RESULT");
-        printf(" socket_fd=%d family=%u dst_ip=%s dst_port=%u ret=%d\n",
-               event->payload.socket_fd, event->payload.family, address,
-               event->payload.destination_port, event->payload.ret);
-        fflush(stdout);
+        if (!quiet_events) {
+            address_family = event->payload.family == AF_INET ? AF_INET :
+                             event->payload.family == AF_INET6 ? AF_INET6 : 0;
+            if (address_family)
+                (void)inet_ntop(address_family,
+                                event->payload.destination_address,
+                                address, sizeof(address));
+            print_header(h, "CONNECT_RESULT");
+            printf(" socket_fd=%d family=%u dst_ip=%s dst_port=%u ret=%d\n",
+                   event->payload.socket_fd, event->payload.family, address,
+                   event->payload.destination_port, event->payload.ret);
+            fflush(stdout);
+        }
         return 0;
     }
     default:
@@ -220,6 +250,55 @@ static int read_sudo_identity(struct run_identity *identity)
     identity->uid = (uid_t)uid_value;
     identity->gid = (gid_t)gid_value;
     return 0;
+}
+
+static int parse_event_mask(const char *text, unsigned int *mask)
+{
+    char copy[64];
+    char *save = NULL;
+    char *token;
+    unsigned int parsed = 0;
+
+    if (!text || strlen(text) >= sizeof(copy))
+        return -1;
+    strcpy(copy, text);
+    for (token = strtok_r(copy, ",", &save); token;
+         token = strtok_r(NULL, ",", &save)) {
+        unsigned int bit;
+
+        if (!strcmp(token, "process"))
+            bit = EVENT_MASK_PROCESS;
+        else if (!strcmp(token, "file"))
+            bit = EVENT_MASK_FILE;
+        else if (!strcmp(token, "network"))
+            bit = EVENT_MASK_NETWORK;
+        else
+            return -1;
+        if (parsed & bit)
+            return -1;
+        parsed |= bit;
+    }
+    if (!parsed)
+        return -1;
+    *mask = parsed;
+    return 0;
+}
+
+static void configure_event_autoload(struct monitor_bpf *skel)
+{
+    int process = !!(event_mask & EVENT_MASK_PROCESS);
+    int file = !!(event_mask & EVENT_MASK_FILE);
+    int network = !!(event_mask & EVENT_MASK_NETWORK);
+
+    bpf_program__set_autoload(skel->progs.handle_execve, process);
+    bpf_program__set_autoload(skel->progs.handle_process_fork, process);
+    bpf_program__set_autoload(skel->progs.handle_process_exit, process);
+    bpf_program__set_autoload(skel->progs.handle_file_open, file);
+    bpf_program__set_autoload(skel->progs.handle_path_unlink, file);
+    bpf_program__set_autoload(skel->progs.handle_openat_enter, file);
+    bpf_program__set_autoload(skel->progs.handle_openat_exit, file);
+    bpf_program__set_autoload(skel->progs.handle_connect_enter, network);
+    bpf_program__set_autoload(skel->progs.handle_connect_exit, network);
 }
 
 static int parse_id(const char *text, __u32 *id)
@@ -350,10 +429,13 @@ static void prepared_gated_exec(int gate_fd, int ready_fd, char **command,
 static void print_usage(const char *program)
 {
     fprintf(stderr,
-            "usage: %s --agent ID [--deny-shell]"
+            "usage: %s [--quiet-events] [--events LIST]"
+            " [--file-open-sample-every N] --agent ID [--deny-shell]"
             " [--sensitive-path DIR] [--workspace DIR]"
             " [--failed-open-threshold N]"
-            " [--failed-open-window-ms MS] -- COMMAND [ARG ...]"
+            " [--failed-open-window-ms MS]"
+            " [--cpu-sample-ms MS] [--cpu-threshold-percent PERCENT]"
+            " -- COMMAND [ARG ...]"
             " [--next --agent ID [POLICY ...] -- COMMAND [ARG ...]]\n",
             program);
 }
@@ -363,6 +445,31 @@ static int parse_agents(int argc, char **argv, struct agent_process *agents,
 {
     int index = 1;
     size_t count = 0;
+
+    while (index < argc) {
+        if (!strcmp(argv[index], "--quiet-events")) {
+            if (quiet_events)
+                return -1;
+            quiet_events = 1;
+            index++;
+        } else if (!strcmp(argv[index], "--events")) {
+            if (index + 1 >= argc ||
+                parse_event_mask(argv[index + 1], &event_mask))
+                return -1;
+            index += 2;
+        } else if (!strcmp(argv[index], "--file-open-sample-every")) {
+            unsigned long value;
+
+            if (index + 1 >= argc ||
+                parse_unsigned(argv[index + 1], &value) ||
+                !value || value > UINT32_MAX)
+                return -1;
+            file_open_sample_every = (__u32)value;
+            index += 2;
+        } else {
+            break;
+        }
+    }
 
     while (index < argc) {
         int command_start;
@@ -419,6 +526,25 @@ static int parse_agents(int argc, char **argv, struct agent_process *agents,
                     !value || value > UINT32_MAX)
                     return -1;
                 agents[count].failed_open_window_ms = (__u32)value;
+            } else if (!strcmp(argv[option_index], "--cpu-sample-ms")) {
+                unsigned long value;
+
+                if (agents[count].cpu_sample_ms ||
+                    option_index + 1 >= argc ||
+                    parse_unsigned(argv[++option_index], &value) ||
+                    value < 100 || value > UINT32_MAX)
+                    return -1;
+                agents[count].cpu_sample_ms = (__u32)value;
+            } else if (!strcmp(argv[option_index],
+                               "--cpu-threshold-percent")) {
+                unsigned long value;
+
+                if (agents[count].cpu_threshold_percent ||
+                    option_index + 1 >= argc ||
+                    parse_unsigned(argv[++option_index], &value) ||
+                    !value || value > 10000)
+                    return -1;
+                agents[count].cpu_threshold_percent = (__u32)value;
             } else {
                 return -1;
             }
@@ -428,8 +554,15 @@ static int parse_agents(int argc, char **argv, struct agent_process *agents,
             return -1;
 
         if (!!agents[count].failed_open_threshold !=
-            !!agents[count].failed_open_window_ms)
+            !!agents[count].failed_open_window_ms ||
+            !!agents[count].cpu_sample_ms !=
+            !!agents[count].cpu_threshold_percent)
             return -1;
+        if (file_open_sample_every > 1 && agents[count].sensitive_path) {
+            fprintf(stderr,
+                    "FILE_OPEN sampling is incompatible with --sensitive-path\n");
+            return -1;
+        }
 
         command_start = option_index + 1;
         separator = command_start;
@@ -487,6 +620,7 @@ int main(int argc, char **argv)
     struct run_identity identity = {0};
     struct agent_process agents[MAX_AGENTS] = {0};
     struct detector detector;
+    struct resource_sampler resource_sampler;
     size_t agent_count = 0;
     size_t index;
     size_t remaining;
@@ -507,13 +641,15 @@ int main(int argc, char **argv)
         return 2;
     }
     detector_init(&detector);
+    resource_sampler_init(&resource_sampler);
     for (index = 0; index < agent_count; index++) {
         if (detector_add_agent(&detector, agents[index].agent_id,
                                agents[index].deny_shell,
                                agents[index].sensitive_path,
                                agents[index].workspace_path,
                                agents[index].failed_open_threshold,
-                               agents[index].failed_open_window_ms)) {
+                               agents[index].failed_open_window_ms,
+                               agents[index].cpu_threshold_percent)) {
             fprintf(stderr, "failed to configure detector\n");
             return 1;
         }
@@ -529,6 +665,10 @@ int main(int argc, char **argv)
     signal(SIGTERM, on_signal);
 
     skel = monitor_bpf__open();
+    if (skel) {
+        configure_event_autoload(skel);
+        skel->rodata->file_open_sample_every = file_open_sample_every;
+    }
     if (!skel || (err = monitor_bpf__load(skel)) ||
         (err = monitor_bpf__attach(skel))) {
         fprintf(stderr, "failed to open/load/attach BPF program: %d\n", err);
@@ -557,10 +697,16 @@ int main(int argc, char **argv)
         agent->cgroup_created = 1;
         if (cgroup_id(agent->cgroup_path, &agent->cgroup_id))
             goto cleanup;
-        if (bpf_map_update_elem(map_fd, &agent->cgroup_id,
-                                &agent->agent_id, BPF_ANY)) {
-            perror("register Agent cgroup");
-            goto cleanup;
+        {
+            struct agent_context context = {
+                .agent_id = agent->agent_id,
+            };
+
+            if (bpf_map_update_elem(map_fd, &agent->cgroup_id,
+                                    &context, BPF_ANY)) {
+                perror("register Agent cgroup");
+                goto cleanup;
+            }
         }
         agent->registered = 1;
 
@@ -609,6 +755,13 @@ int main(int argc, char **argv)
 
         if (move_and_verify(agent->cgroup_path, agent->child))
             goto cleanup;
+        if (agent->cpu_sample_ms &&
+            resource_sampler_add_agent(&resource_sampler, agent->agent_id,
+                                       agent->cgroup_id, agent->cgroup_path,
+                                       agent->cpu_sample_ms)) {
+            perror("initialize Agent CPU sampler");
+            goto cleanup;
+        }
         printf("event=agent_register agent_id=%u cgroup_id=%" PRIu64
                " root_pid=%ld run_uid=%lu run_gid=%lu"
                " basis=controlled_launch\n",
@@ -637,6 +790,9 @@ int main(int argc, char **argv)
             goto cleanup;
         }
 
+        resource_sampler_collect_due(&resource_sampler, on_resource_sample,
+                                     &detector);
+
         for (index = 0; index < agent_count; index++) {
             pid_t waited;
 
@@ -658,6 +814,9 @@ int main(int argc, char **argv)
             (void)ring_buffer__consume(rb);
             for (index = 0; index < agent_count; index++) {
                 if (agents[index].reaped && agents[index].child > 0) {
+                    resource_sampler_collect_agent(
+                        &resource_sampler, agents[index].agent_id,
+                        on_resource_sample, &detector);
                     print_agent_exit(&agents[index]);
                     agents[index].child = -agents[index].child;
                 }

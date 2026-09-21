@@ -362,3 +362,151 @@ elapsed_ns=304268 时产生唯一一条 medium 告警，使用
 path_basis=reconstructed_attempt、reconstruction=absolute。Python 启动阶段
 探测的多个缺失配置文件分别保持 count=1，没有与目标路径合并。Agent 与监控器
 整体退出状态均为 0。
+
+## CPU 资源采样与联合异常
+
+resource_sampler.c 在用户态读取各 Agent cgroup 的 cpu.stat。相邻两次
+usage_usec 的差值除以单调时钟区间，得到单核等价值：100% 表示占满一个
+CPU 核，多线程 Agent 可以超过 100%。采样失败会输出
+resource_sample_error，不会用零值代替。
+
+每个 Agent 用以下两个参数成对启用 CPU 采样：
+
+- --cpu-sample-ms MS：采样周期，当前最小 100 ms。
+- --cpu-threshold-percent PERCENT：单核等价阈值。
+
+CPU 超阈值本身输出 resource_sample。若同一 Agent 在重复失败打开规则的同一
+时间窗内也已达到次数阈值，detector 额外输出一次
+rule=resource_logic_anomaly，同时保留原有的 repeated_failed_open 告警。
+
+验证命令：
+
+    sudo ./build/monitor \
+      --agent 1 \
+      --failed-open-threshold 5 \
+      --failed-open-window-ms 2000 \
+      --cpu-sample-ms 200 \
+      --cpu-threshold-percent 50 \
+      -- /usr/bin/python3 experiments/resource_logic_anomaly.py
+    echo $?
+
+预期同一路径的计数达到 5，随后出现 CPU 百分比不低于 50 的样本，以及一条
+resource_logic_anomaly。该工作负载用于功能验证，阈值不是生产环境默认值。
+
+### 多 Agent 联合异常隔离验证
+
+三组并发测试分别提供“只有重复失败”“只有高 CPU”和“两项证据同时存在”。
+所有 Agent 都配置相同阈值，预期只有 Agent 3 输出 resource_logic_anomaly：
+
+    sudo ./build/monitor \
+      --agent 1 --failed-open-threshold 5 --failed-open-window-ms 2000 \
+      --cpu-sample-ms 200 --cpu-threshold-percent 50 \
+      -- /usr/bin/python3 experiments/repeated_failed_open_idle.py \
+      --next \
+      --agent 2 --failed-open-threshold 5 --failed-open-window-ms 2000 \
+      --cpu-sample-ms 200 --cpu-threshold-percent 50 \
+      -- /usr/bin/python3 experiments/cpu_busy_only.py \
+      --next \
+      --agent 3 --failed-open-threshold 5 --failed-open-window-ms 2000 \
+      --cpu-sample-ms 200 --cpu-threshold-percent 50 \
+      -- /usr/bin/python3 experiments/resource_logic_anomaly.py
+    echo $?
+
+Agent 1 仍应产生独立 repeated_failed_open 告警；Agent 2 应出现高 CPU 样本；
+Agent 3 应同时产生 repeated_failed_open 和唯一一条联合告警。若 Agent 1 或
+Agent 2 出现联合告警，则说明证据隔离或测试时序存在问题。
+
+## 初步性能对比
+
+固定混合工作负载包括 CPU 计算、10000 次 /dev/null 打开、500 次本地 TCP
+连接和 100 个 true 子进程。它在业务阶段内部计时，分别报告总耗时及各阶段耗时。
+驱动脚本先预热一次，再交替运行无监控和有监控的配对样本，默认各 5 次：
+
+    experiments/run_performance_benchmark.sh
+
+监控输出重定向到 /dev/null，因此终端渲染不计入，但 Ring Buffer 消费与用户态
+格式化仍属于当前原型开销。报告使用各组中位数计算：
+
+    overhead_percent = (monitored_median / baseline_median - 1) * 100
+
+这是 VirtualBox 开发环境中的初步端到端测量。它不能直接证明达到赛题 5% 指标；
+正式结论还需在真实 Linux 机器上固定 CPU、增加重复次数并记录方差。
+
+### 静默原始事件基准模式
+
+在第一个 Agent 前添加 --quiet-events，可停止普通原始事件的字符串格式化和输出：
+
+    sudo ./build/monitor --quiet-events --agent 1 -- COMMAND
+
+该模式仍加载相同 eBPF 探针、传输和校验 Ring Buffer 事件，并继续调用 detector；
+注册、退出、资源样本和告警不受影响。它用于拆分采集/检测成本与逐事件日志成本，
+不应作为日常审计日志模式。性能驱动脚本已改用此模式。
+
+### 按事件类别启用探针
+
+全局参数 --events LIST 支持逗号分隔的 process、file、network，必须放在第一个
+--agent 前。未指定时默认全部启用。例如只采集文件事件：
+
+    sudo ./build/monitor --quiet-events --events file \
+      --agent 1 -- COMMAND
+
+未选择类别的 BPF 程序会在加载前关闭 autoload，不会附着到对应 hook。该接口用于
+性能隔离和按需部署；关闭类别也会关闭依赖它的原始事件与规则证据。
+
+### FILE_OPEN 低开销抽样模式
+
+默认全量模式等价于 --file-open-sample-every 1。设置更大的 N 后，内核按 Agent
+cgroup 对 FILE_OPEN 计数，只保留第 1 次及之后每隔 N 次的真实路径事件。例如：
+
+    sudo ./build/monitor --file-open-sample-every 100 \
+      --agent 1 -- COMMAND
+
+抽样判断发生在 bpf_d_path 和 Ring Buffer 申请之前。FILE_UNLINK、失败 openat、
+进程和网络事件不受影响。抽样可能漏掉普通文件打开，因此配置 --sensitive-path
+时禁止 N>1；需要完整审计时保持默认值 1。
+
+采样计数和 agent_id 保存在同一个 cgroup 归属 map value 中。每次 FILE_OPEN
+只需一次 cgroup map 查询，再对其中的计数原子递增，避免为采样单独查询第二张 map。
+
+比较全量、1/10 和 1/100 文件采集开销：
+
+    ./experiments/run_file_sampling_benchmark.sh
+
+### FILE_OPEN N=100 稳定性复测
+
+完成 15 对相邻样本并报告配对开销中位数及 25%～75% 四分位区间：
+
+    ./experiments/run_file_sampling_stability.sh
+
+paired_overhead_median_percent 是每一对先计算开销后得到的中位数；p25/p75 区间
+反映中间 50% 样本的波动。虚拟机结果仍只用于开发阶段判断。
+
+## 使用阿里云百炼 Qwen 运行真实 Codex Agent
+
+experiments/run_bailian_codex.sh 使用 Codex CLI 作为本地 Agent harness，
+将模型请求发往百炼 Responses API。脚本默认模型为 qwen3.8-max-0902，
+不读取普通 ~/.codex/config.toml，不持久化会话，也不在仓库中保存 API Key。
+
+先从百炼控制台复制当前业务空间的 API Host，然后在终端中安全读入密钥：
+
+    read -rsp "Bailian API Key: " BAILIAN_API_KEY
+    export BAILIAN_API_KEY
+    echo
+    export BAILIAN_BASE_URL='https://你的WorkspaceId.cn-beijing.maas.aliyuncs.com/compatible-mode/v1'
+
+首次先脱离监控器验证 provider、模型名称和 Responses API：
+
+    ./experiments/run_bailian_codex.sh '只回复 BAILIAN_OK，不读取或修改文件'
+
+确认成功后再通过受控启动器运行。sudo 默认可能清理环境变量，因此只显式保留
+这两个百炼变量：
+
+    mkdir -p /tmp/ebpf-agent-monitor-qwen-smoke
+    sudo --preserve-env=BAILIAN_API_KEY,BAILIAN_BASE_URL \
+      ./build/monitor --events process,network --agent 1 -- \
+      ./experiments/run_bailian_codex.sh \
+      --cd /tmp/ebpf-agent-monitor-qwen-smoke \
+      '只回复 MONITORED_AGENT_OK，不读取或修改文件'
+
+可以通过 BAILIAN_MODEL 覆盖默认模型；若使用该变量，sudo 时也需加入
+--preserve-env。不要把 API Key 写进命令参数、仓库文件或测试日志。
