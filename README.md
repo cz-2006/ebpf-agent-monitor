@@ -230,6 +230,11 @@ Agent 1；Agent 2（cgroup 10024/PID 12321）连接
 `127.0.0.1:52379`，CONNECT_RESULT 仅归属 Agent 2。两组 Python 启动事件
 高度交错，Agent 2 退出后 Agent 1 继续运行，仍无串组；两组和整体退出状态均为 0。
 
+两个真实 Codex CLI Agent 的只读并发实验也已通过：两组网络连接事件交错，
+各自的 `cat` 只打开本组标记文件，cgroup 与 agent_id 均未串组；两组及监控器
+退出状态均为 0。命令、证据与模型用量见
+[双真实 Agent 实验](experiments/dual_real_agent_readonly.md)。
+
 
 ## 用户态异常检测
 

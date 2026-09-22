@@ -24,8 +24,9 @@
 项目仍采用小步设计与验证，但已形成可构建、可运行的 libbpf CO-RE 正式原型：
 单监控器可受控启动最多 16 个 Agent，以 cgroup 归属事件，采集进程、真实文件路径、
 网络连接和失败 openat；独立用户态 detector 已有三类安全规则、重复失败活动规则，
-并结合 cgroup CPU 样本识别一种资源/逻辑联合异常。单个真实 Codex Agent 的
-进程、网络、文件读取已实测；VirtualBox 中已完成初步性能测量，未达到 5% 参考指标。
+并结合 cgroup CPU 样本识别一种资源/逻辑联合异常。两个真实 Codex Agent 的
+并发进程、网络及各自文件读取已实测；VirtualBox 中已完成初步性能测量，未达到
+5% 参考指标。
 现状与缺口按赛题基础要求汇总于 `docs/acceptance-status.md`。
 
 已验证（依据用户提供的输出，详见 experiments/README.md）：
@@ -48,7 +49,7 @@
 - 实验⑥a：重复失败文件打开规则原型在受控场景通过；PID/TID 22858、agent_id=1，同一路径 5 次 openat 均 ret=-2，count 从 1 到 5，第 5 次 elapsed_ns=1250703（约 1.25 ms，小于 2 s），只输出一条 medium 告警，命令退出状态 0。
 
 尚未覆盖 unlinkat、rename、openat2、更多实例与压力测试、根进程退出后的后代管理、
-双真实 Agent 并发及真实 Agent 触发安全规则。当前联合异常只使用重复失败打开与
+真实 Agent 触发安全规则。当前联合异常只使用重复失败打开与
 CPU 高占用，不等同于一般逻辑死循环检测；性能只有 VirtualBox 初测，尚无真实
 Linux 机器或 5.15 实机复测。失败 openat 使用明确标注的还原尝试路径，不宣称为
 真实规范路径。环境计划中的工具链安装与 feature probe 记录仍按用户原始环境资料
@@ -675,8 +676,22 @@ HTTPS 明文采集是后期研究方向。OpenSSL 的 SSL_read/SSL_write 仅是�
   comm=monitor 的 bwrap/动态加载器 FILE_OPEN；该选项并未隐藏所有启动文件事件。
 
 - 2026-09-22 已按 problem.md 整理 `docs/acceptance-status.md` 验收证据清单。
-  当前受控脚本已覆盖正式原型的主要基础采集、规则和联合异常；真实 Codex 仅验证
-  单 Agent 的进程、网络与文件读取。双真实 Agent 并发、真实 Agent 安全规则、
-  真实 Linux 机器性能与 5.15 兼容验证仍缺证据；虚拟机 N=100 抽样逐对总开销
-  中位数 8.08%，不能宣称达到 5%。下一步先设计短任务与模型额度预算，再做
-  双真实 Agent 和安全规则验证。
+  整理时受控脚本已覆盖正式原型的主要基础采集、规则和联合异常；真实 Codex
+  尚只验证单 Agent 的进程、网络与文件读取。双真实 Agent 并发已于下文完成，
+  真实 Agent 安全规则、真实 Linux 机器性能与 5.15 兼容验证仍缺证据；
+  虚拟机 N=100 抽样逐对总开销中位数 8.08%，不能宣称达到 5%。
+
+- 2026-09-22 用户选择先验证两个真实 Codex Agent 并发归属。已在
+  `experiments/dual_real_agent_readonly.md` 写明短任务、完整运行命令和核对标准；
+  `/tmp/ebpf-agent-monitor-qwen-dual/agent{1,2}/marker.txt` 已创建为 444 权限，
+  内容分别为 AGENT_ONE_20260922、AGENT_TWO_20260922。无 sudo 的监控器参数解析
+  已进入权限检查，准备阶段未调用模型；随后用户已完成 sudo/百炼测试。
+
+- 2026-09-22 双真实 Codex Agent 只读实验已由用户 sudo 实测通过，详情见
+  `experiments/dual_real_agent_readonly.md`。Agent 1 为 cgroup 10074/PID 24056，
+  Agent 2 为 cgroup 10093/PID 24057，run_uid/run_gid 均为 1000；两组 443 端口
+  CONNECT_RESULT 交错，cat 分别只打开本组 marker.txt，未见串组。两组回复
+  对应标记内容，Agent exit_code 和 monitor_exit 均为 0。文件仍为 444 权限且
+  内容未变。Codex CLI 分别报告 2,070 和 72,777 tokens；后者高于短任务预期，
+  不推断实际计费，不为重复证明同一结论而重跑。当前双真实 Agent 归属已在
+  此场景验证，但仍缺真实 Agent 安全规则、压力和根进程退出后代管理证据。
