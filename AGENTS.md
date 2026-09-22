@@ -23,8 +23,10 @@
 
 项目仍采用小步设计与验证，但已形成可构建、可运行的 libbpf CO-RE 正式原型：
 单监控器可受控启动最多 16 个 Agent，以 cgroup 归属事件，采集进程、真实文件路径、
-网络连接和失败 openat，并在独立用户态 detector 中实现三类安全规则与重复失败活动规则。
-总体设计、真实 Agent 接入、资源/逻辑异常联合判断和性能评测仍未完成。
+网络连接和失败 openat；独立用户态 detector 已有三类安全规则、重复失败活动规则，
+并结合 cgroup CPU 样本识别一种资源/逻辑联合异常。单个真实 Codex Agent 的
+进程、网络、文件读取已实测；VirtualBox 中已完成初步性能测量，未达到 5% 参考指标。
+现状与缺口按赛题基础要求汇总于 `docs/acceptance-status.md`。
 
 已验证（依据用户提供的输出，详见 experiments/README.md）：
 
@@ -45,7 +47,12 @@
 - 实验⑤c：超工作区删除规则原型在受控场景通过；启动器 PID 21413、Agent 1 PID/TID 21414。workspace/allowed.txt 删除成功且 outside_workspace=0、未告警；outside/victim.txt 删除成功且 outside_workspace=1，输出一条 high/success 告警；孩子和监控命令退出状态均为 0。
 - 实验⑥a：重复失败文件打开规则原型在受控场景通过；PID/TID 22858、agent_id=1，同一路径 5 次 openat 均 ret=-2，count 从 1 到 5，第 5 次 elapsed_ns=1250703（约 1.25 ms，小于 2 s），只输出一条 medium 告警，命令退出状态 0。
 
-尚未覆盖 unlinkat、rename、openat2、更多实例与压力测试、根进程退出后的后代管理、真实 Agent、资源/逻辑异常的多维联合判断及性能评测。失败 openat 使用明确标注的还原尝试路径，不宣称为真实规范路径。环境计划中的工具链安装与 feature probe 记录仍按用户原始环境资料理解，不推断为本次重新验证。
+尚未覆盖 unlinkat、rename、openat2、更多实例与压力测试、根进程退出后的后代管理、
+双真实 Agent 并发及真实 Agent 触发安全规则。当前联合异常只使用重复失败打开与
+CPU 高占用，不等同于一般逻辑死循环检测；性能只有 VirtualBox 初测，尚无真实
+Linux 机器或 5.15 实机复测。失败 openat 使用明确标注的还原尝试路径，不宣称为
+真实规范路径。环境计划中的工具链安装与 feature probe 记录仍按用户原始环境资料
+理解，不推断为本次重新验证。
 
 不要将建议架构、候选技术和实施顺序当作已定稿设计，也不要把受控脚本实验等同于完整满足赛题基础要求。
 
@@ -640,3 +647,36 @@ HTTPS 明文采集是后期研究方向。OpenSSL 的 SSL_read/SSL_write 仅是�
   connect 的 EINPROGRESS，成功模型响应证明连接随后异步完成；该网段可能由当前
   代理/虚拟网络合成，不视为百炼真实公网 IP。真实 Agent 的进程、后代、线程和
   网络事件 cgroup 归属已在该受控场景验证。
+
+
+- 2026-09-22 真实 Codex Agent 读取 /tmp 只读文件的实验遇到环境阻塞：模型能
+  响应，但调用 shell 工具时 bubblewrap 报 `Failed RTM_NEWADDR: Operation not
+  permitted`，命令在执行前失败，因此没有目标文件 FILE_OPEN，tokens used=4,550。
+  单纯 --cd 只改变工作目录，不构成文件访问隔离；需共同决定修复沙箱环境或在
+  受控虚拟机中关闭 Codex 内层沙箱后再验证实际工具行为。
+
+
+- 2026-09-22 bwrap 修复与真实 Agent 文件读取已由用户实测通过：按官方 Ubuntu
+  24.04 方法安装/加载 bwrap AppArmor 配置后，本地 bwrap 能读取测试文件。
+  Codex Qwen 在 cgroup_id=8028、agent_id=1、uid=1000 下经工具执行一次
+  `cat marker.txt`；监控器记录 PID 12437 的 FILE_OPEN，真实路径为
+  `/tmp/ebpf-agent-monitor-qwen-readonly/marker.txt`，flags=32768，path_ret=49；
+  Agent 原样报告 EBPF_AGENT_READONLY_20260922，工具、Agent、监控命令状态均为 0，
+  tokens used=1,755。目标文件实验后仍为 444 权限、29 字节且内容未变。
+  真实 Agent 的文件工具调用与内核路径采集、cgroup 归属已在该受控场景验证。
+
+- 2026-09-22 用户选择对 Codex 沙箱文件噪声采用用户态展示过滤。已新增全局
+  `--hide-runtime-noise`（默认关闭）：仅隐藏普通文件事件中 comm 为 `bwrap`、
+  `codex-linux-san` 或路径位于 `/tmp/codex-bwrap-synthetic-mount-targets-` 下的打印。
+  事件仍进入 detector，告警、进程、网络及 Agent 生命周期输出不受影响。
+  `make` 和参数解析检查已通过。用户 sudo 实测本地 bwrap 只读命令：
+  agent_id=1、cgroup_id=8274，bwrap 的普通文件事件未展示，cat 的目标文件
+  FILE_OPEN 保留，读取内容正确，Agent exit_code=0。exec 过渡期仍出现两条
+  comm=monitor 的 bwrap/动态加载器 FILE_OPEN；该选项并未隐藏所有启动文件事件。
+
+- 2026-09-22 已按 problem.md 整理 `docs/acceptance-status.md` 验收证据清单。
+  当前受控脚本已覆盖正式原型的主要基础采集、规则和联合异常；真实 Codex 仅验证
+  单 Agent 的进程、网络与文件读取。双真实 Agent 并发、真实 Agent 安全规则、
+  真实 Linux 机器性能与 5.15 兼容验证仍缺证据；虚拟机 N=100 抽样逐对总开销
+  中位数 8.08%，不能宣称达到 5%。下一步先设计短任务与模型额度预算，再做
+  双真实 Agent 和安全规则验证。

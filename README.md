@@ -1,6 +1,8 @@
 # eBPF Agent Monitor
 
 项目正在把已验证的 bpftrace 实验迁移为 libbpf + CO-RE 正式原型。
+赛题基础要求的实测证据、缺口与后续验证顺序见
+[验收证据清单](docs/acceptance-status.md)。
 
 ## 当前正式原型
 
@@ -452,6 +454,18 @@ Agent 2 出现联合告警，则说明证据隔离或测试时序存在问题。
 
 未选择类别的 BPF 程序会在加载前关闭 autoload，不会附着到对应 hook。该接口用于
 性能隔离和按需部署；关闭类别也会关闭依赖它的原始事件与规则证据。
+
+### 隐藏 Codex 沙箱文件噪声
+
+在第一个 Agent 前添加 `--hide-runtime-noise`，可隐藏 `bwrap`、
+`codex-linux-san` 进程，以及 `/tmp/codex-bwrap-synthetic-mount-targets-`
+路径下的普通文件事件输出。默认不隐藏。例如：
+
+    sudo ./build/monitor --hide-runtime-noise --agent 1 -- COMMAND
+
+此选项只影响用户态展示：文件事件仍被采集、校验并交给 detector，告警不隐藏；
+进程、网络和 Agent 注册/退出事件照常显示。目标文件由 `cat` 打开的事件也会显示。
+隐藏的沙箱临时文件操作仍真实发生，若需完整审计日志，不使用此选项。
 
 ### FILE_OPEN 低开销抽样模式
 

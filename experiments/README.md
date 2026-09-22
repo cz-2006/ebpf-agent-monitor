@@ -793,3 +793,31 @@ shell 语法、缺少密钥时的拒绝路径和 git diff --check 已通过。�
   198.18.0.0/15 在当前虚拟机/代理环境中可能是合成或转发地址，不将其宣称为百炼
   服务的真实公网 IP。Codex 的线程及 lsb_release/getconf 辅助进程始终保持相同
   agent_id/cgroup_id，真实 Agent 的进程与网络归属链路已在该受控场景验证。
+
+
+- 2026-09-22 首次真实 Codex 文件读取实验未完成：使用独立 /tmp 目录及只读
+  marker.txt，Codex 模型已响应，但所有 shell 工具调用在执行前因 bubblewrap
+  `Failed RTM_NEWADDR: Operation not permitted` 失败，未发生 marker.txt 的
+  FILE_OPEN。模型报告无法读取文件，本轮 tokens used=4,550。后续需共同选择
+  修复用户命名空间/沙箱环境，或在隔离虚拟机中明确放弃 Codex 内层沙箱再复测；
+  仅使用 --cd 不能限制 Agent 对文件系统的访问。
+
+
+- 2026-09-22 按 OpenAI Docs 的 Ubuntu 24.04 步骤加载 bwrap AppArmor 配置后，
+  本地 bwrap 只读测试成功，真实 Codex 文件读取实验也已通过。单监控器受控启动
+  Agent 1：root PID 12080、cgroup_id=8028、run_uid/run_gid=1000。Codex 经
+  bubblewrap 调用 `cat marker.txt`，PID/TID 12437 的 FILE_OPEN 给出内核解析路径
+  `/tmp/ebpf-agent-monitor-qwen-readonly/marker.txt`、flags=32768、path_ret=49、
+  agent_id=1、cgroup_id=8028；Codex 原样报告 EBPF_AGENT_READONLY_20260922，
+  工具退出码、Agent exit_code 和监控命令状态均为 0。模型用量 1,755 tokens。
+  实验后目标文件仍为 444 权限、29 字节且内容未变。日志中大量 bwrap/Codex
+  初始化文件事件属于同组环境活动，不能把它们当成业务文件读取。
+
+- 为方便复核上述业务事件，新增可选 `--hide-runtime-noise`。它仅在用户态隐藏
+  bwrap、codex-linux-san 和 Codex 临时挂载路径的普通文件事件打印；目标文件
+  `cat` 打开事件、其他类别事件及告警照常显示，detector 仍处理完整事件。
+  用户 sudo 实测本地 bwrap 只读命令通过：agent_id=1、cgroup_id=8274，
+  bwrap 的普通文件事件未展示；cat（PID 16346）的目标文件 FILE_OPEN
+  保留，路径为 `/tmp/ebpf-agent-monitor-qwen-readonly/marker.txt`，
+  path_ret=49，读到 EBPF_AGENT_READONLY_20260922，Agent exit_code=0。
+  exec 过渡期有两条 comm=monitor 的 FILE_OPEN，当前过滤规则未覆盖它们。

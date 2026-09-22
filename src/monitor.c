@@ -28,6 +28,7 @@
 #define EVENT_MASK_ALL (EVENT_MASK_PROCESS | EVENT_MASK_FILE | EVENT_MASK_NETWORK)
 static volatile sig_atomic_t stop;
 static int quiet_events;
+static int hide_runtime_noise;
 static unsigned int event_mask = EVENT_MASK_ALL;
 static __u32 file_open_sample_every = 1;
 
@@ -75,6 +76,20 @@ static void print_header(const struct monitor_event_header *h,
            (uint64_t)h->timestamp_ns, (uint64_t)h->cgroup_id, event_name,
            h->pid, h->tid, h->ppid, h->uid, h->agent_id,
            EVENT_COMM_LEN, h->comm);
+}
+
+/* 只过滤普通文件事件的展示；检测器仍接收完整事件。 */
+static int hide_runtime_file_event(const struct monitor_event_header *h,
+                                   const char *path)
+{
+    if (!hide_runtime_noise)
+        return 0;
+    if (!strncmp(h->comm, "bwrap", EVENT_COMM_LEN) ||
+        !strncmp(h->comm, "codex-linux-san", EVENT_COMM_LEN))
+        return 1;
+    return path &&
+           !strncmp(path, "/tmp/codex-bwrap-synthetic-mount-targets-",
+                    sizeof("/tmp/codex-bwrap-synthetic-mount-targets-") - 1);
 }
 
 static int on_event(void *ctx, void *data, size_t size)
@@ -128,7 +143,8 @@ static int on_event(void *ctx, void *data, size_t size)
         const struct file_open_event *event = data;
         if (size != sizeof(*event))
             break;
-        if (!quiet_events) {
+        if (!quiet_events &&
+            !hide_runtime_file_event(h, event->payload.path)) {
             print_header(h, "FILE_OPEN");
             printf(" path=%.*s flags=%u path_ret=%d\n",
                    EVENT_FILENAME_LEN, event->payload.path,
@@ -144,7 +160,8 @@ static int on_event(void *ctx, void *data, size_t size)
             break;
         size_t dir_len;
 
-        if (!quiet_events) {
+        if (!quiet_events &&
+            !hide_runtime_file_event(h, event->payload.dir_path)) {
             print_header(h, "FILE_UNLINK_ATTEMPT");
             dir_len = strnlen(event->payload.dir_path, EVENT_FILENAME_LEN);
             printf(" path=%.*s%s%.*s path_ret=%d name_ret=%d\n",
@@ -163,7 +180,8 @@ static int on_event(void *ctx, void *data, size_t size)
 
         if (size != sizeof(*event))
             break;
-        if (!quiet_events) {
+        if (!quiet_events &&
+            !hide_runtime_file_event(h, event->payload.attempted_path)) {
             print_header(h, "FILE_OPEN_RESULT");
             printf(" dirfd=%d attempted_path=%.*s ret=%d"
                    " path_basis=syscall_input\n",
@@ -429,7 +447,7 @@ static void prepared_gated_exec(int gate_fd, int ready_fd, char **command,
 static void print_usage(const char *program)
 {
     fprintf(stderr,
-            "usage: %s [--quiet-events] [--events LIST]"
+            "usage: %s [--quiet-events] [--hide-runtime-noise] [--events LIST]"
             " [--file-open-sample-every N] --agent ID [--deny-shell]"
             " [--sensitive-path DIR] [--workspace DIR]"
             " [--failed-open-threshold N]"
@@ -451,6 +469,11 @@ static int parse_agents(int argc, char **argv, struct agent_process *agents,
             if (quiet_events)
                 return -1;
             quiet_events = 1;
+            index++;
+        } else if (!strcmp(argv[index], "--hide-runtime-noise")) {
+            if (hide_runtime_noise)
+                return -1;
+            hide_runtime_noise = 1;
             index++;
         } else if (!strcmp(argv[index], "--events")) {
             if (index + 1 >= argc ||
