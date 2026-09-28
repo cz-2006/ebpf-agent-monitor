@@ -820,3 +820,13 @@ HTTPS 明文采集是后期研究方向。OpenSSL 的 SSL_read/SSL_write 仅是�
   检查全部 PASS，resource_logic_anomaly CPU=95.67%，monitor_exit=0，最终
   DEMO_RESULT=PASS。两组 agent_exit 均为 exit_code=0、basis=cgroup_empty，确认
   新退出条件未破坏既有多 Agent 采集和检测链路。
+
+- 2026-09-28 为课堂演示新增两个真实 Agent 一键脚本及 `experiments/real_agent_demo.md`。
+  简单版单 Agent 展示敏感读取；全面版双 Agent 展示归属、网络、敏感读取、Shell
+  审计和工作区外删除。两者都自动准备无害临时夹具、记录完整日志并输出 PASS/FAIL。
+  API Key 缺失时由终端隐藏读取，避免写入命令历史；Base URL 和模型使用安全默认值。
+  用户已完成两套 sudo/真实模型端到端复测：简单版五项检查全部 PASS，Agent 1
+  cgroup=8443/PID=17103；全面版十一项检查全部 PASS，Agent 1 为
+  cgroup=8557/PID=17989，Agent 2 为 cgroup=8576/PID=17990。两次 monitor_exit
+  和 DEMO_RESULT 均为 0/PASS；全面版两组网络、Shell audit、安全规则和最终
+  cgroup_empty 退出均正确，未见串组。

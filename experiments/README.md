@@ -779,6 +779,17 @@ sudo/eBPF 一键运行：Agent 1 为 cgroup 7886/PID 25750，Agent 2 为 cgroup
 打开和资源联合异常的 11 项检查全部 PASS，monitor_exit=0，最终
 `DEMO_RESULT=PASS`。联合异常 CPU 样本为 97.70%，两组归因未串组。
 
+## 一键真实 Agent 课堂演示（2026-09-28）
+
+新增 `run_real_agent_demo_simple.sh` 与 `run_real_agent_demo_full.sh`。简单版使用一个
+真实 Codex Agent 演示敏感文件读取；全面版并发使用两个真实 Codex Agent，演示
+独立 cgroup 归属、网络事件、敏感读取、Shell 审计和工作区外删除。脚本自动准备
+无害 `/tmp` 夹具、保存完整日志、筛选关键证据并输出 PASS/FAIL。API Key 未预先
+配置时由终端隐藏读取，不进入 Shell 历史。用户已完成两套真实模型端到端复测：
+简单版五项检查全部 PASS；全面版十一项检查全部 PASS；两者 monitor_exit=0、
+DEMO_RESULT=PASS。全面版两组 Agent 分别归于 cgroup 8557 和 8576，敏感读取、
+工作区外删除、Shell audit、网络及排空退出均符合预期。详情见 `real_agent_demo.md`。
+
 ## 根进程先退出、后代继续运行（2026-09-28）
 
 `root_exit_descendant.py` 的根进程 fork 一个孩子后立即退出；孩子继续运行约

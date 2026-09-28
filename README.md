@@ -586,3 +586,18 @@ experiments/run_bailian_codex.sh 使用 Codex CLI 作为本地 Agent harness，
 
 该命令用于答辩演示和回归基础链路，不代替真实 Agent、压力、性能或 5.15 实机
 验证。运行前若 `build/monitor` 不存在，先执行 `make`。
+
+## 一键真实 Agent 演示
+
+课堂演示提供两个只需一条命令启动的版本：
+
+```bash
+./experiments/run_real_agent_demo_simple.sh
+./experiments/run_real_agent_demo_full.sh
+```
+
+简单版使用一个真实 Codex Agent 展示敏感文件读取；全面版并发使用两个真实
+Codex Agent，展示独立 cgroup 归属、网络事件、敏感读取、Shell 审计和工作区外
+删除。两个脚本都自动准备无害临时夹具、保存完整日志、筛选关键证据，并输出
+`DEMO_RESULT=PASS` 或 `FAIL`。运行前需要构建监控器；API Key 由脚本隐藏读取，不要
+写进命令行或仓库。完整说明见 `experiments/real_agent_demo.md`。
