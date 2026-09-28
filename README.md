@@ -103,8 +103,9 @@ event=agent_exit agent_id=1 cgroup_id=11286 root_pid=41507 exit_code=0
 
 当前支持一个监控器受控启动最多 16 个根 Agent，cgroup 内的后代会自然继承归属。
 正式版已采集 fork/exit 生命周期、open/unlink 真实路径和 IPv4/IPv6 connect 结果，
-并开始加入用户态异常规则。Agent 根进程退出后仍存活的后代处理、事件存储、压力测试
-和性能评测仍未实现。
+并已加入用户态异常规则。Agent 根进程退出后，监控器会继续跟踪同 cgroup 后代，
+直到 cgroup 排空再输出最终退出记录。事件持久化、压力与事件丢失测试尚未实现；
+VirtualBox 性能初测已经完成，但未达到 5% 参考指标。
 
 ## 进程生命周期验证
 

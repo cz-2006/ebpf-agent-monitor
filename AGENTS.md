@@ -1,6 +1,6 @@
 # 项目长期上下文
 
-更新时间：2026-09-21
+更新时间：2026-09-28
 
 ## 项目与资料
 
@@ -25,8 +25,11 @@
 单监控器可受控启动最多 16 个 Agent，以 cgroup 归属事件，采集进程、真实文件路径、
 网络连接和失败 openat；独立用户态 detector 已有三类安全规则、重复失败活动规则，
 并结合 cgroup CPU 样本识别一种资源/逻辑联合异常。两个真实 Codex Agent 的
-并发进程、网络及各自文件读取已实测，单个真实 Codex 触发敏感读取告警也已验证；
-VirtualBox 中已完成初步性能测量，未达到 5% 参考指标。
+并发进程、网络及各自文件读取已实测；真实 Codex 触发敏感读取、Shell 审计和
+工作区外删除告警也已验证。根进程先退出时，监控器会继续跟踪同 cgroup 后代，
+直到 cgroup 排空后再输出最终 agent_exit。VirtualBox 中已完成初步性能测量，
+未达到 5% 参考指标。生命周期修改后的双 Agent 一键验收已于 2026-09-28 复跑，
+11 项检查全部 PASS，monitor_exit=0，DEMO_RESULT=PASS。
 现状与缺口按赛题基础要求汇总于 `docs/acceptance-status.md`。
 
 已验证（依据用户提供的输出，详见 experiments/README.md）：
@@ -48,12 +51,11 @@ VirtualBox 中已完成初步性能测量，未达到 5% 参考指标。
 - 实验⑤c：超工作区删除规则原型在受控场景通过；启动器 PID 21413、Agent 1 PID/TID 21414。workspace/allowed.txt 删除成功且 outside_workspace=0、未告警；outside/victim.txt 删除成功且 outside_workspace=1，输出一条 high/success 告警；孩子和监控命令退出状态均为 0。
 - 实验⑥a：重复失败文件打开规则原型在受控场景通过；PID/TID 22858、agent_id=1，同一路径 5 次 openat 均 ret=-2，count 从 1 到 5，第 5 次 elapsed_ns=1250703（约 1.25 ms，小于 2 s），只输出一条 medium 告警，命令退出状态 0。
 
-尚未覆盖 unlinkat、rename、openat2、更多实例与压力测试、根进程退出后的后代管理、
-真实 Agent 触发 Shell 与工作区外删除规则。当前联合异常只使用重复失败打开与
-CPU 高占用，不等同于一般逻辑死循环检测；性能只有 VirtualBox 初测，尚无真实
-Linux 机器或 5.15 实机复测。失败 openat 使用明确标注的还原尝试路径，不宣称为
-真实规范路径。环境计划中的工具链安装与 feature probe 记录仍按用户原始环境资料
-理解，不推断为本次重新验证。
+尚未覆盖 unlinkat、rename、openat2、更多实例压力与事件丢失测试。当前联合异常
+只使用重复失败打开与 CPU 高占用，不等同于一般逻辑死循环检测；性能只有
+VirtualBox 初测，尚无真实 Linux 机器或 5.15 实机复测。失败 openat 使用明确标注的
+还原尝试路径，不宣称为真实规范路径。环境计划中的工具链安装与 feature probe
+记录仍按用户原始环境资料理解，不推断为本次重新验证。
 
 不要将建议架构、候选技术和实施顺序当作已定稿设计，也不要把受控脚本实验等同于完整满足赛题基础要求。
 
@@ -63,7 +65,7 @@ Linux 机器或 5.15 实机复测。失败 openat 使用明确标注的还原尝
 - 老师允许半成品；大赛评审指标仅供参考，不把比赛全部指标直接当作本次课程交付的硬性验收条件。
 - 最新确认的优先级：先尽量完成 `problem.md` 的基础要求；基础要求完成且仍有余力，再推进进阶要求。
 - 基础阶段优先覆盖多 Agent 并发下的进程、文件、网络 IP/端口采集，Agent 归属，安全异常与资源/逻辑异常检测，以及带时间、PID/TID、操作对象和归因依据的告警。
-- 网络采集、敏感文件访问规则、重复活动检测均纳入基础阶段规划；具体实现深度根据时间与验证结果调整，尚未完成总体设计。
+- 基础阶段的总体设计和正式原型已经形成，设计说明见 `docs/design.md`；后续以课程交付整理、复现验证和如实记录限制为先。
 - 验证和文档属于基础交付的一部分，应先于进阶开发完成。如有缺项或仅在受控场景验证，明确记录限制，不宣称完整满足基础要求。
 - HTTPS 明文、Prompt/Response 精确因果关联及多智能体协作/竞争异常属于后续进阶方向。可视化界面和容器化部署暂非优先事项。
 - 性能可做初步测量并如实报告；比赛的性能损耗不大于 5% 指标保留为参考目标，未经测量不得宣称达标。
@@ -104,7 +106,7 @@ Linux 机器或 5.15 实机复测。失败 openat 使用明确标注的还原尝
 
 VirtualBox 用于开发、功能验证与原型调试。最终性能评测优先使用真实 Linux 机器、实验室服务器或比赛指定环境，记录基线、工作负载与测量方法；不能用未经验证的虚拟机结果宣称达到 5% 指标。
 
-## 初步技术方向（待设计确认）
+## 早期技术方向（历史记录，后续正式设计以 `docs/design.md` 为准）
 
 建议主线为 libbpf + CO-RE；bpftrace/BCC 用于快速实验。候选数据流：
 
@@ -130,7 +132,7 @@ HTTPS 明文采集是后期研究方向。OpenSSL 的 SSL_read/SSL_write 仅是�
 
 基础规则候选：非预期 Shell、敏感文件访问、超工作区删除、高频 API/网络调用、重复进程/文件活动。规则阈值、工作区边界、授权语义及多维判定方法尚未定义；网络连接次数不能直接等同于 API 调用次数。
 
-## 实验方向与当前讨论进度（2026-09-15）
+## 实验方向与当时讨论进度（历史记录，2026-09-15）
 
 - 用户初步同意先用可控脚本验证监测流程，再接入真实 Agent；具体真实 Agent 尚未选定。
 - 两个脚本是第一轮并发实验的最小规模，不是系统支持数量上限。后续需验证更多实例的归属准确性、事件丢失和开销，支持规模未经测量。
@@ -138,7 +140,7 @@ HTTPS 明文采集是后期研究方向。OpenSSL 的 SSL_read/SSL_write 仅是�
 - 用户已确认的实验顺序：单程序执行观测 → 两组并发与子进程归属 → 文件操作 → 网络连接 → 安全规则 → 重复活动。文件规则实验建议使用专门创建的临时测试文件。
 - 用户已确认开始六个实验，按共同设计模式逐步推进。实验①已由用户运行并提供目标 execve 入口事件，最小观测目标通过；未提供完整终端输出或退出状态，不据此断言 execve 成功或程序正常退出。记录见 experiments/README.md。实测内核 7.0.0-31-generic、bpftrace v0.20.2；sudo 需要交互密码。实验②已确认先采用进程树跟踪，从一组父子进程开始。已准备 experiments/fork_exec.py 与 experiments/process_tree.bt，运行与限制见 experiments/README.md；实验②a 已由用户成功加载探针并实测通过：根 PID 29031 创建孩子 29032，孩子执行 true 时继承 agent_id=1，父子退出事件齐全，工作负载报告孩子退出码 0。实验②b 已准备 experiments/two_agents.py 与 experiments/two_agents.bt；用户实测双组归属通过：Agent 1 根 32947 → 孩子 32950，Agent 2 根 32948 → 孩子 32949，四个退出事件齐全、工作负载均成功。根进程生命周期重叠，孩子并非同时运行；不是压力测试。两处符号类型比较警告已用 uint32 显式转换修正，用户已复跑并确认 warning 消失，未提供新版完整输出；归属通过结论依据上一轮完整输出。正式归属方案及后续实验设计仍需共同讨论。
 
-## 当前接续点（2026-09-16）
+## 当时接续点（历史记录，2026-09-16）
 
 - 实验①至⑤c及⑥a 的既定受控目标已由用户实测通过，详见 experiments/README.md。⑥a 中 PID 22858 对同一路径 5 次 openat 均返回 -2，计数 1→5，第 5 次累计约 1.25 ms，只产生一条 medium 告警，命令退出状态 0。该规则只是重复无意义文件活动的一种证据，不单独证明逻辑死循环或资源浪费。下一步应共同回顾六组实验与正式系统设计范围，不自动把实验脚本视为正式实现。 用户随后确认正式实现路线选择 libbpf + CO-RE、全 C 单程序。第一个里程碑只打通 execve 的内核 tracepoint → Ring Buffer → C 用户态输出；观测点确认使用 sys_enter_execve，事件语义和名称为 EXEC_ATTEMPT，只表示执行尝试，不表示成功，后续可新增 EXEC_SUCCESS。仓库当前未发现正式 C 源码、Makefile/CMake 或 vmlinux.h。用户确认统一事件格式采用“公共事件头 + 各事件专属载荷”，用户态先按 event_type 分派。第一版公共头最初确认为 timestamp_ns（单调时钟）、size、event_type、pid、tid、ppid、uid、agent_id、comm[16]；EXEC_ATTEMPT 载荷为 filename[256]。后续用户正式确认以 cgroup 作为唯一 Agent 归属依据、进程树只负责生命周期和回溯，因此公共头已增加原始归因字段 cgroup_id；agent_id 是 cgroup_id→agent_id map 的业务结果，当前仍为 0。构建方案确认为 Makefile + 标准 libbpf CO-RE skeleton；计划目录为 include/events.h、src/monitor.bpf.c、src/monitor.c，build/ 存放生成的 vmlinux.h、BPF 对象、skeleton 和可执行文件，生成文件不手工修改。具体运行过滤方式仍待共同确认。 已按确认方案创建第一版正式骨架：include/events.h、src/monitor.bpf.c、src/monitor.c、Makefile、README.md 和 .gitignore；make 构建成功，生成 build/vmlinux.h、monitor.bpf.o、monitor.skel.h、monitor。BPF 对象为 eBPF ELF，用户程序为 x86-64 ELF 并正确链接 libbpf。用户已 sudo 实测正式原型通过：捕获 `/usr/bin/true` 的 EXEC_ATTEMPT（timestamp_ns=5354623581568，PID/TID 29389，PPID 29373，UID 1000，agent_id=0，comm=bash），Ring Buffer 与用户态解析正常，Ctrl-C 后命令退出状态 0；系统范围输出包含大量 VS Code 后台事件，符合当前无过滤设计。构建时将共享结构名由通用 event_header 改为 monitor_event_header 以避开本机 vmlinux.h 同名结构，字段设计不变；对生成的 vmlinux.h 关闭 Clang 18 的 missing-declarations 警告。 用户确认 cgroup 主归属方案后，已在共享头、BPF 生产端和用户态输出加入 cgroup_id，并重新 make 成功。用户 sudo 实测字段通过：`/usr/bin/true` 事件 timestamp_ns=7103999361810、cgroup_id=9201、PID/TID 32795、PPID 32768、UID 1000、agent_id=0、comm=bash；未出现尺寸错误。所示 VS Code 与终端事件均为 cgroup_id=9201，说明当前尚未分组；用户未提供本轮退出状态，不推断。
 - 用户此前不了解 eBPF，需经常指导和解释；继续按“解释概念 → 运行小步骤 → 解读输出”推进，不假设已掌握。
@@ -148,18 +150,13 @@ HTTPS 明文采集是后期研究方向。OpenSSL 的 SSL_read/SSL_write 仅是�
 - 所有 sudo 命令（包括 sudo -n）均交用户运行，助手不得尝试。工具沙箱此前持续报 bwrap loopback 权限错误，文件操作通过工具授权在沙箱外完成；此问题不代表 eBPF 不可用。
 - VS Code bpftrace 高亮扩展仅介绍过，未确认安装；无需为接续实验再次要求安装。
 
-## 后续推进建议
+## 当前后续推进建议（2026-09-28）
 
-1. 明确总体设计与第一阶段验收范围，选定被监控 Agent 和实验场景。
-2. bpftrace execve 最小观测已验证；按已确认实验顺序继续共同设计并验证并发与子进程归属。
-3. 编写最小 libbpf CO-RE execve collector，打通内核事件到用户态输出。
-4. 逐步加入进程生命周期、文件、网络事件，设计统一事件结构及用户态采集接口。
-5. 建立 PID/PPID → agent_id 映射，验证多 Agent 并发归属。
-6. 实现基础异常规则及含上下文、证据和归因信息的告警日志。
-7. 完成基础功能的正常/异常及多 Agent 并发验证、初步性能测量和可复现文档，记录未完成项与限制。
-8. 基础要求完成且仍有余力时，再研究 uprobes、Prompt/Response 关联等进阶能力；按实际预算深化性能优化。
-
-这是初步顺序，具体实现应随设计结论调整。
+1. 完成课程交付材料：统一 README、设计说明、验收状态与演示步骤，确保新环境可复现。
+2. 做一次干净构建与无特权静态检查；需要 sudo 的 eBPF 验收仍由用户运行并回传结果。
+3. 整理演示讲解与已知限制，明确受控脚本证据、真实 Agent 证据和性能数据的边界。
+4. 如仍有时间，再选择补充 openat2/unlinkat/rename、压力与事件丢失测试，或真实 Linux/5.15 性能复测。
+5. 基础交付稳定后，再研究 HTTPS 明文、Prompt/Response 关联及多智能体协作/竞争异常。
 
 ## 后续协作与记录约定
 
@@ -205,8 +202,8 @@ HTTPS 明文采集是后期研究方向。OpenSSL 的 SSL_read/SSL_write 仅是�
 - 实测 EXEC_ATTEMPT 的 comm=monitor 符合 execve 入口语义，filename=/usr/bin/true
   才是目标。uid=0 表明当前 sudo 监控器派生的 Agent 也以 root 运行；接入真实 Agent 前
   需共同设计目标 UID/GID 的保留或降权流程，当前不能把 root 身份当作最终运行方案。
-- 当前边界：一次只启动一个根 Agent；后代依靠 cgroup 自然继承归属，但尚无正式
-  fork/exit 事件，也未处理根进程退出后仍存活的后代。多 Agent 控制面留待后续共同设计。
+- 当时边界：一次只启动一个根 Agent，尚无正式 fork/exit 和后代排空处理；这些能力
+  已在后续里程碑实现。本段保留用于说明演进过程。
 
 - 2026-09-21 用户选择受控启动降权方案 1：自动继承 sudo 调用者身份。监控器现在
   在加载前核验非 root 的 SUDO_UID/SUDO_GID/SUDO_USER 与 passwd 数据库；
@@ -331,8 +328,8 @@ HTTPS 明文采集是后期研究方向。OpenSSL 的 SSL_read/SSL_write 仅是�
   EXEC_ATTEMPT、动态加载 FILE_OPEN、PROCESS_EXIT 交错但归属稳定，无串组。
   两个退出时间戳只相差 29 ns，生命周期重叠；两组 exit_code 和整体命令状态均为 0。
   这是两组受控短任务验证，不是更多实例或压力测试。
-- 当前仍只直接管理根 PID；根进程退出后仍存活的后代和按 cgroup 整体终止/等待
-  尚未实现，不能把本次上限或根进程测试当作压力与完整后代管理结论。
+- 当时仍只直接等待根 PID；根进程退出后的 cgroup 排空等待已于 2026-09-28 实现并
+  实测。最多 16 个根 Agent 是控制面上限，仍不能视为压力或事件丢失测试结论。
 - 用户已 sudo 实测双 Agent 混合行为通过：Agent 1 为 cgroup 10005/PID 12320，
   sample.txt 的 FILE_OPEN/FILE_UNLINK_ATTEMPT 均保持 Agent 1 归属；Agent 2 为
   cgroup 10024/PID 12321，CONNECT_RESULT 目标 127.0.0.1:52379、fd 4、ret=0
@@ -700,7 +697,8 @@ HTTPS 明文采集是后期研究方向。OpenSSL 的 SSL_read/SSL_write 仅是�
   对应标记内容，Agent exit_code 和 monitor_exit 均为 0。文件仍为 444 权限且
   内容未变。Codex CLI 分别报告 2,070 和 72,777 tokens；后者高于短任务预期，
   不推断实际计费，不为重复证明同一结论而重跑。当前双真实 Agent 归属已在
-  此场景验证，但仍缺真实 Agent 安全规则、压力和根进程退出后代管理证据。
+  此场景验证。当时仍缺的真实 Agent 安全规则和根进程退出后代管理证据已于
+  2026-09-28 补齐；压力与事件丢失测试仍缺。
 
 - 2026-09-28 用户选择验证真实 Codex Agent 触发 sensitive_file_access。
   已创建 `experiments/real_agent_sensitive_read.md`，并准备 444 权限的无害夹具

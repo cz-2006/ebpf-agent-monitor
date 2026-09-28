@@ -753,7 +753,7 @@ agent_id 和 file_open_count。FILE_OPEN 用已有归属查询结果完成原子
 文件阶段中心值也未改善。该优化已通过 verifier 和端到端运行，但一次额外 map
 查询不是主要瓶颈，差异不足以从 VirtualBox 波动中稳定区分，仍未达到 5%。
 
-## 真实 Codex Agent + 百炼 Qwen（直连已通过，受控网络待复测）
+## 真实 Codex Agent + 百炼 Qwen（历史接入与验证记录）
 
 当前启动器默认模型已于 2026-09-28 从额度耗尽的 qwen3.8-max-0902 切换为
 qwen3.8-27b；下面保留的是首次接入 Max 模型时的历史验证记录。
