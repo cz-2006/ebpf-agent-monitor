@@ -779,6 +779,36 @@ sudo/eBPF 一键运行：Agent 1 为 cgroup 7886/PID 25750，Agent 2 为 cgroup
 打开和资源联合异常的 11 项检查全部 PASS，monitor_exit=0，最终
 `DEMO_RESULT=PASS`。联合异常 CPU 样本为 97.70%，两组归因未串组。
 
+## 根进程先退出、后代继续运行（2026-09-28）
+
+`root_exit_descendant.py` 的根进程 fork 一个孩子后立即退出；孩子继续运行约
+0.8 秒再自然退出。该实验验证监控器不会在根退出时注销 cgroup 映射或终止孩子，
+并区分 `agent_root_exit`、`agent_cgroup_drained` 与最终 `agent_exit`。
+
+```bash
+sudo ./build/monitor --events process \
+  --agent 1 -- /usr/bin/python3 experiments/root_exit_descendant.py
+echo $?
+```
+
+预期根进程的 PROCESS_EXIT 和 `agent_root_exit` 先出现；随后孩子输出
+`state=done` 并产生 PROCESS_EXIT；最后才出现 `agent_cgroup_drained` 以及
+`agent_exit ... basis=cgroup_empty`。监控器应返回根进程的退出状态。代码已严格
+编译，Python 语法已检查。
+
+用户 sudo 实测通过：Agent 1 为 cgroup 7756、根 PID 7605，孩子 PID 7606。
+根进程 exit_code_raw=0 后先输出 `agent_root_exit`；孩子此时继续运行，随后
+`state=done`，退出事件中的 PPID 已变为 1，但 agent_id=1、cgroup_id=7756 保持
+不变。孩子自然退出后才输出 `agent_cgroup_drained` 和
+`agent_exit ... exit_code=0 basis=cgroup_empty`，监控命令状态为 0。该结果验证
+根进程退出后不会终止计算后代，也不会提前撤销其 cgroup 归属。
+
+生命周期修改后的完整一键回归也已通过：Agent 1 为 cgroup 8178/PID 10412，
+Agent 2 为 cgroup 8197/PID 10413；11 项检查全部 PASS，CPU 联合异常样本为
+95.67%，monitor_exit=0，最终 `DEMO_RESULT=PASS`。两组最终退出记录均带
+`basis=cgroup_empty`，说明新的 cgroup 排空条件没有破坏原有多 Agent、进程、
+文件、网络和 detector 链路。
+
 新增 run_bailian_codex.sh，使用本机 Codex CLI 0.155.1 作为 Agent harness，
 通过独立命令行配置将 qwen3.8-max-0902 指向百炼 Responses API。脚本使用
 --ignore-user-config 和 --ephemeral，API Key 只从 BAILIAN_API_KEY

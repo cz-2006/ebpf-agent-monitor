@@ -2,7 +2,8 @@
 
 项目正在把已验证的 bpftrace 实验迁移为 libbpf + CO-RE 正式原型。
 赛题基础要求的实测证据、缺口与后续验证顺序见
-[验收证据清单](docs/acceptance-status.md)。
+[验收证据清单](docs/acceptance-status.md)。架构、事件语义、策略设计、验证结果和
+扩展边界集中说明于[系统设计与实现说明](docs/design.md)。
 
 ## 当前正式原型
 
@@ -57,6 +58,18 @@ event=agent_register agent_id=1 cgroup_id=... root_pid=... run_uid=1000 run_gid=
 timestamp_ns=... cgroup_id=... event=EXEC_ATTEMPT pid=... uid=1000 agent_id=1 ... filename=/usr/bin/true
 event=agent_exit agent_id=1 cgroup_id=... root_pid=... exit_code=0
 ```
+
+`agent_root_exit` 表示受控启动的根进程已经退出，但它创建的后代可能仍在运行。
+监控器会继续保留 cgroup 归属并采集后代，读取 cgroup v2 的 `cgroup.events`
+`populated` 状态；只有整个 cgroup 变空后才输出：
+
+```text
+event=agent_cgroup_drained agent_id=1 cgroup_id=... root_pid=...
+event=agent_exit agent_id=1 cgroup_id=... root_pid=... exit_code=0 basis=cgroup_empty
+```
+
+默认不会因为根进程退出而终止后台计算任务。若后代长期运行，监控器也会继续运行；
+当前尚未提供自动超时清理策略。
 
 三行中的 `agent_id` 应均为 1，注册行与业务事件的 `cgroup_id` 应一致。
 请回传完整输出和 `echo $?` 的结果。

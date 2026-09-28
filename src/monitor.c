@@ -51,6 +51,8 @@ struct agent_process {
     int cgroup_created;
     int registered;
     int reaped;
+    int root_exit_reported;
+    int drained;
     enum detector_shell_policy shell_policy;
     int shell_policy_set;
     const char *sensitive_path;
@@ -400,6 +402,34 @@ static int move_and_verify(const char *path, pid_t pid)
     return -1;
 }
 
+static int cgroup_is_populated(const char *path, int *populated)
+{
+    char file_path[PATH_MAX];
+    char key[64];
+    long value;
+    FILE *file;
+    int n;
+
+    n = snprintf(file_path, sizeof(file_path), "%s/cgroup.events", path);
+    if (n < 0 || (size_t)n >= sizeof(file_path))
+        return -1;
+    file = fopen(file_path, "r");
+    if (!file) {
+        perror("open cgroup.events");
+        return -1;
+    }
+    while (fscanf(file, "%63s %ld", key, &value) == 2) {
+        if (!strcmp(key, "populated")) {
+            fclose(file);
+            *populated = !!value;
+            return 0;
+        }
+    }
+    fclose(file);
+    fprintf(stderr, "cgroup.events has no populated field: %s\n", path);
+    return -1;
+}
+
 /*
  * 第一阶段在原 cgroup 中完成可能访问 NSS/组文件的 initgroups；
  * 第二阶段等待父进程迁移并登记 cgroup 后，再放弃 root 并 exec。
@@ -653,16 +683,35 @@ static int status_result(int status)
     return 1;
 }
 
-static void print_agent_exit(const struct agent_process *agent)
+static void print_root_exit(const struct agent_process *agent)
 {
     if (WIFEXITED(agent->status)) {
-        printf("event=agent_exit agent_id=%u cgroup_id=%" PRIu64
+        printf("event=agent_root_exit agent_id=%u cgroup_id=%" PRIu64
                " root_pid=%ld exit_code=%d\n",
                agent->agent_id, (uint64_t)agent->cgroup_id,
                (long)agent->child, WEXITSTATUS(agent->status));
     } else if (WIFSIGNALED(agent->status)) {
-        printf("event=agent_exit agent_id=%u cgroup_id=%" PRIu64
+        printf("event=agent_root_exit agent_id=%u cgroup_id=%" PRIu64
                " root_pid=%ld signal=%d\n",
+               agent->agent_id, (uint64_t)agent->cgroup_id,
+               (long)agent->child, WTERMSIG(agent->status));
+    }
+    fflush(stdout);
+}
+
+static void print_agent_drained(const struct agent_process *agent)
+{
+    printf("event=agent_cgroup_drained agent_id=%u cgroup_id=%" PRIu64
+           " root_pid=%ld\n",
+           agent->agent_id, (uint64_t)agent->cgroup_id, (long)agent->child);
+    if (WIFEXITED(agent->status)) {
+        printf("event=agent_exit agent_id=%u cgroup_id=%" PRIu64
+               " root_pid=%ld exit_code=%d basis=cgroup_empty\n",
+               agent->agent_id, (uint64_t)agent->cgroup_id,
+               (long)agent->child, WEXITSTATUS(agent->status));
+    } else if (WIFSIGNALED(agent->status)) {
+        printf("event=agent_exit agent_id=%u cgroup_id=%" PRIu64
+               " root_pid=%ld signal=%d basis=cgroup_empty\n",
                agent->agent_id, (uint64_t)agent->cgroup_id,
                (long)agent->child, WTERMSIG(agent->status));
     }
@@ -841,6 +890,7 @@ int main(int argc, char **argv)
     remaining = agent_count;
     while (remaining) {
         int newly_reaped = 0;
+        int newly_drained = 0;
 
         err = ring_buffer__poll(rb, 100);
         if (err < 0 && err != -EINTR) {
@@ -860,7 +910,6 @@ int main(int argc, char **argv)
                              WNOHANG);
             if (waited == agents[index].child) {
                 agents[index].reaped = 1;
-                remaining--;
                 newly_reaped = 1;
             } else if (waited < 0 && errno != EINTR) {
                 perror("waitpid");
@@ -871,13 +920,38 @@ int main(int argc, char **argv)
         if (newly_reaped) {
             (void)ring_buffer__consume(rb);
             for (index = 0; index < agent_count; index++) {
-                if (agents[index].reaped && agents[index].child > 0) {
-                    resource_sampler_collect_agent(
-                        &resource_sampler, agents[index].agent_id,
-                        on_resource_sample, &detector);
-                    print_agent_exit(&agents[index]);
-                    agents[index].child = -agents[index].child;
+                if (agents[index].reaped &&
+                    !agents[index].root_exit_reported) {
+                    print_root_exit(&agents[index]);
+                    agents[index].root_exit_reported = 1;
                 }
+            }
+        }
+
+        for (index = 0; index < agent_count; index++) {
+            int populated;
+
+            if (!agents[index].reaped || agents[index].drained)
+                continue;
+            if (cgroup_is_populated(agents[index].cgroup_path, &populated))
+                goto cleanup;
+            if (!populated) {
+                agents[index].drained = 1;
+                remaining--;
+                newly_drained = 1;
+            }
+        }
+
+        if (newly_drained) {
+            (void)ring_buffer__consume(rb);
+            for (index = 0; index < agent_count; index++) {
+                if (!agents[index].drained || agents[index].child < 0)
+                    continue;
+                resource_sampler_collect_agent(
+                    &resource_sampler, agents[index].agent_id,
+                    on_resource_sample, &detector);
+                print_agent_drained(&agents[index]);
+                agents[index].child = -agents[index].child;
             }
         }
 

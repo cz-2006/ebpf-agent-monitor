@@ -795,3 +795,30 @@ HTTPS 明文采集是后期研究方向。OpenSSL 的 SSL_read/SSL_write 仅是�
   outside_workspace_delete、repeated_failed_open 和 resource_logic_anomaly 共 11 项
   检查全部 PASS，联合异常 CPU=97.70%，monitor_exit=0，最终 DEMO_RESULT=PASS。
   该演示定位为确定性、零模型额度的基础回归；真实 Codex 证据仍由各专项实验提供。
+
+- 2026-09-28 用户选择根进程退出后一直等待 Agent cgroup 自然变空，不自动终止
+  后代。监控器新增读取 cgroup v2 `cgroup.events` 的 populated 状态：waitpid
+  根进程后输出 `agent_root_exit`，继续保留 BPF 映射、Ring Buffer 和 CPU 采集；
+  populated=0 后输出 `agent_cgroup_drained` 和带 `basis=cgroup_empty` 的最终
+  `agent_exit`，再进入注销与清理。新增 `experiments/root_exit_descendant.py`，
+  根先退出、孩子延迟 0.8 秒退出。严格 make 和 Python 语法通过，待用户 sudo
+  验证事件顺序与后代未被终止。
+
+- 2026-09-28 根退出后代等待已由用户 sudo 实测通过。Agent 1 为 cgroup 7756、
+  根 PID 7605、孩子 PID 7606。根 exit 后先输出 agent_root_exit；孩子继续运行
+  约 0.8 秒，PPID 变为 1，但 PROCESS_EXIT 仍为 agent_id=1/cgroup_id=7756。
+  孩子自然退出后才输出 agent_cgroup_drained 和
+  `agent_exit exit_code=0 basis=cgroup_empty`，监控状态为 0。该结果确认根退出
+  不会杀死后代或提前撤销归属。
+
+- 2026-09-28 已新增 `docs/design.md` 作为交付设计说明，集中记录总体架构、
+  cgroup 归属和根退出生命周期、七类事件语义、用户态安全/联合异常策略、确定性
+  与真实 Codex 验证、性能数据、已知限制及 Prompt/Response 扩展接口。README
+  已增加入口；文档明确不把失败 openat 还原路径、unlink 尝试、EINPROGRESS、
+  VirtualBox 性能或受控实验夸大为更强结论。
+
+- 2026-09-28 cgroup 排空生命周期修改后的完整一键回归已由用户 sudo 通过。
+  Agent 1 为 cgroup 8178/PID 10412，Agent 2 为 cgroup 8197/PID 10413；11 项
+  检查全部 PASS，resource_logic_anomaly CPU=95.67%，monitor_exit=0，最终
+  DEMO_RESULT=PASS。两组 agent_exit 均为 exit_code=0、basis=cgroup_empty，确认
+  新退出条件未破坏既有多 Agent 采集和检测链路。
