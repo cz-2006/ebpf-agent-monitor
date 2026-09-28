@@ -240,26 +240,36 @@ Agent 1；Agent 2（cgroup 10024/PID 12321）连接
 
 采集与检测已拆分：`monitor.c` 负责校验、输出原始事件并把事件交给
 `detector.c`；检测器按 `agent_id` 查找策略并输出告警。首条正式规则为
-`unexpected_shell`，通过每个 Agent 的 `--deny-shell` 单独启用：
+Shell 规则通过每个 Agent 的 `--shell-policy deny|audit|allow` 单独配置；未配置时
+保持关闭。`deny` 输出 high `unexpected_shell` 告警，`audit` 输出
+`event=activity_evidence rule=shell_execution` 审计证据，`allow` 不产生检测器输出。
+旧参数 `--deny-shell` 保留为 `--shell-policy deny` 的兼容别名：
 
 ```bash
-sudo ./build/monitor   --agent 1 --deny-shell -- /usr/bin/python3 experiments/unexpected_shell.py   --next   --agent 2 -- /usr/bin/true
+sudo ./build/monitor   --agent 1 --shell-policy deny -- /usr/bin/python3 experiments/unexpected_shell.py   --next   --agent 2 --shell-policy audit -- /usr/bin/true
 echo $?
 ```
 
-Agent 1 尝试执行 `sh`、`bash`、`dash`、`zsh`、`ksh` 或 `fish`
-时应产生一条 `rule=unexpected_shell` 告警；Agent 2 未启用该策略，不应因
-Shell 尝试产生此规则告警。规则使用精确的可执行文件 basename 匹配，证据字段为
-`exec_attempt,cgroup_attribution`。它只证明捕获到 execve 尝试，不证明执行成功。
+Agent 尝试执行 `sh`、`bash`、`dash`、`zsh`、`ksh` 或 `fish` 时，检测器按其
+策略处理。规则使用精确的可执行文件 basename 匹配，证据字段为
+`exec_attempt,cgroup_attribution`。告警或审计记录只证明捕获到 execve 尝试，
+不证明执行成功。每个 Agent 只能配置一次 Shell 策略，兼容参数与新参数不能并用。
 
-代码已在严格警告设置下构建通过。本地事件样本确认：启用策略的 Agent 执行
-`/bin/sh` 产生一条告警，未启用策略的 Agent 以及 `/usr/bin/ssh` 均不告警。
+代码已在严格警告设置下构建通过。本地事件样本确认：`deny` 对 `/bin/bash`
+产生一条 high 告警，`audit` 产生一条活动证据，`allow` 不产生检测器输出；
+`/usr/bin/ssh` 不匹配 Shell 名单。
 
 正式双 Agent 端到端验证已通过：Agent 1（cgroup 10402，根 PID 15588）启用
 `--deny-shell`，孩子 PID 15590 的 `EXEC_ATTEMPT filename=/bin/sh` 紧接着产生
 唯一一条 `unexpected_shell` 告警；两条记录 timestamp、PID/TID、agent_id 和
 cgroup_id 完全一致。Agent 2（cgroup 10421，PID 15589）未启用该策略，执行
 `/usr/bin/true` 时没有规则告警。两个 Agent 和监控器整体退出状态均为 0。
+
+真实 Codex 实测说明该规则不能直接等同于攻击判定：即使使用无 Shell 包装器，
+Codex 框架在收到任务前仍正常启动两次 Bash，工具调用阶段又启动两次，四次均被
+准确告警。采集与字段关联有效，但当前 basename 黑名单缺少启动阶段、命令内容和
+授权上下文，会产生框架级误报。详情见
+[真实 Agent Shell 实验](experiments/real_agent_unexpected_shell.md)。
 
 
 ### 敏感目录读取规则
@@ -288,13 +298,21 @@ timestamp=4120192636297 产生唯一一条 sensitive_file_access 告警。告警
 agent_id、cgroup_id、PID/TID 和完整路径均与原始事件一致；清理产生的
 FILE_UNLINK_ATTEMPT 未触发该规则。Agent 和监控器整体退出状态均为 0。
 
+真实 Codex Agent 只读打开专用测试文件时，也产生了唯一一条字段完全对应的
+`sensitive_file_access` 告警；Codex 原样报告文件内容，文件未改变，Agent 和
+监控器均正常退出。完整命令与证据见
+[真实 Agent 敏感读取实验](experiments/real_agent_sensitive_read.md)。
+
 
 ### 工作区外删除尝试规则
 
-每个 Agent 可通过 `--workspace DIR` 配置允许删除的工作区。目录使用与敏感路径
+每个 Agent 可通过 `--workspace DIR` 配置允许删除的业务工作区，并可重复使用
+`--runtime-path DIR` 声明 Agent 框架需要维护的运行时目录。目录使用与敏感路径
 相同的规范化和边界匹配；`FILE_UNLINK_ATTEMPT` 的父目录与 dentry 名称在
-detector 中还原为完整路径。工作区内不告警，工作区外输出
-`outside_workspace_delete`。父目录或名称解析失败时不猜测归类。
+detector 中还原为完整路径。工作区内不输出，运行时目录内输出
+`activity_evidence rule=runtime_file_delete` 审计证据，其余路径输出 high
+`outside_workspace_delete`。父目录或名称解析失败时不猜测归类。运行时路径是
+显式策略，不依据 `comm` 或进程名自动放行。
 
 正式验证命令：
 
@@ -315,6 +333,14 @@ FILE_UNLINK_ATTEMPT 与唯一一条 outside_workspace_delete 告警共享
 timestamp=4576044265090，且 PID/TID、agent_id、cgroup_id 和完整路径完全对应。
 工作负载确认两次删除均完成，Agent 与监控器整体退出状态均为 0；检测规则本身
 仍只使用删除前尝试作为证据。
+
+真实 Codex 会正常清理 Bubblewrap 临时挂载项和 `~/.codex` 状态文件。可将这些
+目录显式配置为运行时审计范围，使其保留证据而不与真正的越界目标同列为 high：
+
+```bash
+--runtime-path /tmp/codex-bwrap-synthetic-mount-targets-1000 \
+--runtime-path /home/felix/.codex
+```
 
 
 ### 重复失败文件打开规则
@@ -503,7 +529,7 @@ paired_overhead_median_percent 是每一对先计算开销后得到的中位数�
 ## 使用阿里云百炼 Qwen 运行真实 Codex Agent
 
 experiments/run_bailian_codex.sh 使用 Codex CLI 作为本地 Agent harness，
-将模型请求发往百炼 Responses API。脚本默认模型为 qwen3.8-max-0902，
+将模型请求发往百炼 Responses API。脚本当前默认模型为 qwen3.8-27b，
 不读取普通 ~/.codex/config.toml，不持久化会话，也不在仓库中保存 API Key。
 
 先从百炼控制台复制当前业务空间的 API Host，然后在终端中安全读入密钥：
@@ -529,3 +555,20 @@ experiments/run_bailian_codex.sh 使用 Codex CLI 作为本地 Agent harness，
 
 可以通过 BAILIAN_MODEL 覆盖默认模型；若使用该变量，sudo 时也需加入
 --preserve-env。不要把 API Key 写进命令参数、仓库文件或测试日志。
+
+## 一键基础验收演示
+
+不调用外部模型即可运行一次双 Agent 确定性演示：
+
+```bash
+./experiments/run_acceptance_demo.sh
+```
+
+脚本以普通用户启动并在内部调用 `sudo`，自动创建唯一的 `/tmp` 夹具目录。Agent 1
+产生敏感读取、允许/越界删除、重复失败打开及 CPU 联合异常；Agent 2 产生 fork、
+非预期 Shell 和本地 IPv4 连接。正式 `build/monitor` 同时监控两组，脚本随后逐项
+检查告警、连接、生命周期和退出状态，成功时输出 `DEMO_RESULT=PASS`。完整日志默认
+保存在 `/tmp/ebpf-agent-monitor-acceptance-demo.log`，夹具目录在结束时清理。
+
+该命令用于答辩演示和回归基础链路，不代替真实 Agent、压力、性能或 5.15 实机
+验证。运行前若 `build/monitor` 不存在，先执行 `make`。

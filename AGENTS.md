@@ -25,8 +25,8 @@
 单监控器可受控启动最多 16 个 Agent，以 cgroup 归属事件，采集进程、真实文件路径、
 网络连接和失败 openat；独立用户态 detector 已有三类安全规则、重复失败活动规则，
 并结合 cgroup CPU 样本识别一种资源/逻辑联合异常。两个真实 Codex Agent 的
-并发进程、网络及各自文件读取已实测；VirtualBox 中已完成初步性能测量，未达到
-5% 参考指标。
+并发进程、网络及各自文件读取已实测，单个真实 Codex 触发敏感读取告警也已验证；
+VirtualBox 中已完成初步性能测量，未达到 5% 参考指标。
 现状与缺口按赛题基础要求汇总于 `docs/acceptance-status.md`。
 
 已验证（依据用户提供的输出，详见 experiments/README.md）：
@@ -49,7 +49,7 @@
 - 实验⑥a：重复失败文件打开规则原型在受控场景通过；PID/TID 22858、agent_id=1，同一路径 5 次 openat 均 ret=-2，count 从 1 到 5，第 5 次 elapsed_ns=1250703（约 1.25 ms，小于 2 s），只输出一条 medium 告警，命令退出状态 0。
 
 尚未覆盖 unlinkat、rename、openat2、更多实例与压力测试、根进程退出后的后代管理、
-真实 Agent 触发安全规则。当前联合异常只使用重复失败打开与
+真实 Agent 触发 Shell 与工作区外删除规则。当前联合异常只使用重复失败打开与
 CPU 高占用，不等同于一般逻辑死循环检测；性能只有 VirtualBox 初测，尚无真实
 Linux 机器或 5.15 实机复测。失败 openat 使用明确标注的还原尝试路径，不宣称为
 真实规范路径。环境计划中的工具链安装与 feature probe 记录仍按用户原始环境资料
@@ -631,6 +631,12 @@ HTTPS 明文采集是后期研究方向。OpenSSL 的 SSL_read/SSL_write 仅是�
   实测约 55 KB，是简单请求仍消耗较多上下文的主要候选。受控监控验证尚未进行；
   脚本增加 $HOME/.local/bin/codex fallback，以适配 sudo secure_path。
 
+- 2026-09-28 qwen3.8-max-0902 免费额度已耗尽。用户从仍有 1M 额度的模型中
+  选择继续配置合适后端；当前默认切换为 qwen3.8-27b。百炼官方资料确认该模型
+  支持 Function Calling 和 Responses API，最大输入长度为 991808。两个启动器
+  和本地 model catalog 已同步更新，API Key 与 Base URL 的配置方式不变；旧 Max
+  实验记录保留为历史证据。新模型尚待一次最小直连验证。
+
 
 - 百炼真实 Codex Agent 首次受控启动完成了进程侧验证：根 PID 99752 及 Codex
   创建的线程和 lsb_release/getconf 辅助进程全部保持 agent_id=1、
@@ -695,3 +701,97 @@ HTTPS 明文采集是后期研究方向。OpenSSL 的 SSL_read/SSL_write 仅是�
   内容未变。Codex CLI 分别报告 2,070 和 72,777 tokens；后者高于短任务预期，
   不推断实际计费，不为重复证明同一结论而重跑。当前双真实 Agent 归属已在
   此场景验证，但仍缺真实 Agent 安全规则、压力和根进程退出后代管理证据。
+
+- 2026-09-28 用户选择验证真实 Codex Agent 触发 sensitive_file_access。
+  已创建 `experiments/real_agent_sensitive_read.md`，并准备 444 权限的无害夹具
+  `/tmp/ebpf-agent-monitor-real-sensitive/secret.txt`，内容为
+  REAL_AGENT_SENSITIVE_20260928。实验将使用 `--sensitive-path` 和单次 cat，
+  核对 FILE_OPEN 与告警的时间、PID/TID、agent_id、cgroup_id 和路径；尚未 sudo
+  运行或调用百炼模型。
+
+- 2026-09-28 真实 Codex Agent 敏感读取实验已由用户 sudo 实测通过，详情见
+  `experiments/real_agent_sensitive_read.md`。Agent 1 为 cgroup 7052/PID 7243；
+  cat PID/TID 8041 打开专用 secret.txt 的 FILE_OPEN 与唯一一条 high
+  sensitive_file_access 告警共享 timestamp=1656748469967、agent_id/cgroup_id、
+  PID/TID、target 和 flags=32768。Codex 原样报告标记内容，Agent 与 monitor
+  状态均为 0；文件仍为 444、30 字节且内容未变。Codex CLI 报告 73,323 tokens，
+  不推断实际计费，不为重复证明同一结论而重跑。真实 Agent 安全规则已有敏感读取
+  证据；Shell 和工作区外删除仍只有受控脚本证据。
+
+- 2026-09-28 用户选择继续验证真实 Agent 非预期 Shell。因原有
+  `run_bailian_codex.sh` 本身会启动 Bash，直接使用会污染告警归因；用户选择方案 1，
+  新增 `experiments/run_bailian_codex_no_shell.py`，校验相同百炼配置后以 os.execv
+  直接替换为 Codex。已通过 Python 语法、缺少密钥和非法 URL 拒绝路径检查。
+  `experiments/real_agent_unexpected_shell.md` 记录完整实验；只读夹具位于
+  `/tmp/ebpf-agent-monitor-real-shell/marker.txt`。尚未 sudo 运行或调用模型。
+
+- 2026-09-28 真实 Codex 非预期 Shell 实验已由用户 sudo 实测，详情见
+  `experiments/real_agent_unexpected_shell.md`。无 Shell 启动器消除了包装脚本
+  干扰，但 Codex 框架在收到任务前仍由 tokio worker 启动两次 /bin/bash；工具
+  阶段又启动两次，共产生 4 条字段与 EXEC_ATTEMPT 完全对应的 high 告警。
+  cat 正确读取 marker，Agent/monitor 状态均为 0，文件未变，tokens used=2,088。
+  结论是采集与告警关联有效，但 basename 黑名单对真实 Codex 存在框架级误报，
+  不能将每条命中解释为 Prompt 引发的攻击。改进需共同设计命令、父子链或授权
+  上下文，不应未经讨论直接添加进程名例外。
+
+- 2026-09-28 用户选择用按 Agent 的三态策略处理真实框架 Shell：
+  `--shell-policy deny|audit|allow`。deny 保持输出 high unexpected_shell；audit
+  输出 `activity_evidence rule=shell_execution`，只记录活动而不判异常；allow
+  不产生检测器输出。未配置时仍关闭该规则，旧 `--deny-shell` 保留为 deny 的
+  兼容别名，重复或冲突配置会拒绝启动。实现已通过严格 make、参数解析与本地
+  构造事件验证。
+
+- 2026-09-28 真实 Codex audit 模式已由用户 sudo 复测通过：Agent 1 为
+  cgroup 7456、根 PID 15170，monitor_exit 和 Agent exit_code 均为 0。框架启动
+  与工具阶段共 4 次 /bin/bash EXEC_ATTEMPT，各自对应一条
+  `activity_evidence rule=shell_execution policy=shell_audit`，时间戳、PID/TID、
+  agent_id、cgroup_id、target 完全对应；未出现 unexpected_shell 安全告警。
+  cat 正确打开 marker.txt 并读出预期内容。该结果验证 audit 在真实 Agent 中能
+  保留 Shell 证据而不将已知框架行为直接判为 high 异常。
+
+- 2026-09-28 用户选择用真实删除专用临时夹具的方式验证真实 Agent 工作区外
+  删除规则。已创建 `experiments/real_agent_outside_workspace_delete.md` 和
+  `/tmp/ebpf-agent-monitor-real-delete/{workspace,outside}`；victim.txt 是内容为
+  REAL_AGENT_OUTSIDE_DELETE_20260928 的无害 644 文件。实验让 Codex 只执行一次
+  指定绝对路径的 rm，核对 FILE_UNLINK_ATTEMPT、outside_workspace_delete 告警、
+  字段对应关系和最终文件消失；尚未 sudo 运行或调用模型。
+
+- 2026-09-28 真实 Codex 工作区外删除实验已由用户 sudo 实测。Agent 1 为
+  cgroup 7614、根 PID 19630；rm PID/TID 20276 的 FILE_UNLINK_ATTEMPT 与 high
+  outside_workspace_delete 告警共享 timestamp=4989584454548、agent/cgroup、
+  PID/TID 和 victim.txt 完整路径，path_ret/name_ret 为正。Codex、Agent、monitor
+  状态均为 0，victim_exists=0，目标链路通过。但 Bubblewrap 的 synthetic mount
+  清理以及 Codex 的 shell_snapshots、SQLite shm/wal、tmp/arg0 清理也产生多条
+  high 告警，唯一告警标准失败。结论是采集与路径规则正确，但单一 workspace
+  策略无法表达真实 Codex 的运行时授权目录，当前告警精度不可宣称达标。
+
+- 2026-09-28 用户选择用显式运行时审计路径改进删除规则。新增每 Agent 可重复的
+  `--runtime-path DIR`（最多 8 个）：workspace 内删除不输出；runtime-path 内
+  输出 `activity_evidence rule=runtime_file_delete policy=runtime_delete_audit`；
+  其余路径仍输出 high outside_workspace_delete。匹配使用规范化目录边界，不按
+  comm/进程名硬编码忽略。严格 make、重复参数解析、相对路径拒绝及本地构造的
+  workspace/runtime/outside 三类事件均通过。真实复测将显式配置 Bubblewrap
+  synthetic mount 根目录和 `/home/felix/.codex`，尚待用户运行。
+
+- 2026-09-28 删除分级策略已由真实 Codex sudo 复测通过。Agent 1 为 cgroup
+  7772、根 PID 22730；rm PID/TID 23335 的目标 FILE_UNLINK_ATTEMPT 与唯一一条
+  high outside_workspace_delete 共享 timestamp=6028612007968 及全部归因字段，
+  victim_exists=0。Bubblewrap synthetic mount 的 6 次清理和 `~/.codex` 内的
+  snapshot、SQLite shm/wal、tmp/arg0 清理全部变为 runtime_file_delete 审计证据，
+  未再混入 high。Agent/monitor 状态均为 0。该受控场景通过，但 runtime-path
+  仍由部署者显式配置，不宣称系统能自动理解任意业务授权边界。
+
+- 2026-09-28 用户选择先整理可复现交付演示。新增
+  `experiments/acceptance_demo_agent.py` 和 `run_acceptance_demo.sh`：不调用模型，
+  一次正式 monitor 启动两个确定性 Agent；Agent 1 覆盖敏感读取、允许/越界删除、
+  重复 ENOENT 与 CPU 联合异常，Agent 2 覆盖 shell、fork 和本地 IPv4 connect。
+  外层脚本用 mktemp 准备/清理无害夹具，逐项检查证据并输出 DEMO_RESULT。
+  shell/Python 语法、安全角色和沙箱外本地回环角色均已验证；完整 sudo/eBPF 一键
+  运行尚待用户执行。
+
+- 2026-09-28 一键基础验收演示已由用户 sudo 运行通过。Agent 1 为 cgroup
+  7886/PID 25750，Agent 2 为 cgroup 7905/PID 25751；两组注册/退出、fork、
+  CONNECT_RESULT、unexpected_shell、sensitive_file_access、
+  outside_workspace_delete、repeated_failed_open 和 resource_logic_anomaly 共 11 项
+  检查全部 PASS，联合异常 CPU=97.70%，monitor_exit=0，最终 DEMO_RESULT=PASS。
+  该演示定位为确定性、零模型额度的基础回归；真实 Codex 证据仍由各专项实验提供。

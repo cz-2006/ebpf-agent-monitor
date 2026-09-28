@@ -10,12 +10,22 @@
 
 #define DETECTOR_MAX_AGENTS 16
 #define DETECTOR_MAX_FAILED_OPEN_STATES 128
+#define DETECTOR_MAX_RUNTIME_DIRS 8
+
+enum detector_shell_policy {
+    DETECTOR_SHELL_DISABLED = 0,
+    DETECTOR_SHELL_DENY,
+    DETECTOR_SHELL_AUDIT,
+    DETECTOR_SHELL_ALLOW,
+};
 
 struct detector_agent_policy {
     __u32 agent_id;
-    int deny_shell;
+    enum detector_shell_policy shell_policy;
     char sensitive_dir[EVENT_FILENAME_LEN];
     char workspace_dir[EVENT_FILENAME_LEN];
+    char runtime_dirs[DETECTOR_MAX_RUNTIME_DIRS][EVENT_FILENAME_LEN];
+    size_t runtime_dir_count;
     __u32 failed_open_threshold;
     __u32 failed_open_window_ms;
     __u32 cpu_threshold_percent;
@@ -43,8 +53,11 @@ struct detector {
 
 void detector_init(struct detector *detector);
 int detector_add_agent(struct detector *detector, __u32 agent_id,
-                       int deny_shell, const char *sensitive_path,
+                       enum detector_shell_policy shell_policy,
+                       const char *sensitive_path,
                        const char *workspace_path,
+                       const char *const runtime_paths[],
+                       size_t runtime_path_count,
                        __u32 failed_open_threshold,
                        __u32 failed_open_window_ms,
                        __u32 cpu_threshold_percent);

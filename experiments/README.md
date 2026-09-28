@@ -755,6 +755,30 @@ agent_id 和 file_open_count。FILE_OPEN 用已有归属查询结果完成原子
 
 ## 真实 Codex Agent + 百炼 Qwen（直连已通过，受控网络待复测）
 
+当前启动器默认模型已于 2026-09-28 从额度耗尽的 qwen3.8-max-0902 切换为
+qwen3.8-27b；下面保留的是首次接入 Max 模型时的历史验证记录。
+
+## 一键基础验收演示（2026-09-28）
+
+`run_acceptance_demo.sh` 使用正式监控器同时启动两个确定性 Python Agent，不调用
+百炼或其他外部模型。Agent 1 覆盖敏感读取、工作区内/外删除、5 次同目标 ENOENT
+及约 1.2 秒 CPU 忙循环；Agent 2 覆盖 Shell、fork 和本地 IPv4 connect。脚本使用
+`mktemp` 创建专用夹具，结束后清理，并检查两组注册/退出、进程、网络、三类安全
+规则、重复失败和资源联合异常。全部出现且 monitor 状态为 0 时输出
+`DEMO_RESULT=PASS`，日志写入 `/tmp/ebpf-agent-monitor-acceptance-demo.log`。
+
+运行命令：
+
+```bash
+./experiments/run_acceptance_demo.sh
+```
+
+脚本语法、Python 语法和两个工作负载的无监控执行已验证。用户随后完成正式
+sudo/eBPF 一键运行：Agent 1 为 cgroup 7886/PID 25750，Agent 2 为 cgroup
+7905/PID 25751；两组注册/退出、fork、本地 connect、三类安全规则、重复失败
+打开和资源联合异常的 11 项检查全部 PASS，monitor_exit=0，最终
+`DEMO_RESULT=PASS`。联合异常 CPU 样本为 97.70%，两组归因未串组。
+
 新增 run_bailian_codex.sh，使用本机 Codex CLI 0.155.1 作为 Agent harness，
 通过独立命令行配置将 qwen3.8-max-0902 指向百炼 Responses API。脚本使用
 --ignore-user-config 和 --ephemeral，API Key 只从 BAILIAN_API_KEY

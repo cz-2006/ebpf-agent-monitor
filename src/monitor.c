@@ -51,9 +51,12 @@ struct agent_process {
     int cgroup_created;
     int registered;
     int reaped;
-    int deny_shell;
+    enum detector_shell_policy shell_policy;
+    int shell_policy_set;
     const char *sensitive_path;
     const char *workspace_path;
+    const char *runtime_paths[DETECTOR_MAX_RUNTIME_DIRS];
+    size_t runtime_path_count;
     __u32 failed_open_threshold;
     __u32 failed_open_window_ms;
     __u32 cpu_sample_ms;
@@ -448,14 +451,29 @@ static void print_usage(const char *program)
 {
     fprintf(stderr,
             "usage: %s [--quiet-events] [--hide-runtime-noise] [--events LIST]"
-            " [--file-open-sample-every N] --agent ID [--deny-shell]"
-            " [--sensitive-path DIR] [--workspace DIR]"
+            " [--file-open-sample-every N] --agent ID"
+            " [--shell-policy deny|audit|allow] [--deny-shell]"
+            " [--sensitive-path DIR] [--workspace DIR] [--runtime-path DIR]"
             " [--failed-open-threshold N]"
             " [--failed-open-window-ms MS]"
             " [--cpu-sample-ms MS] [--cpu-threshold-percent PERCENT]"
             " -- COMMAND [ARG ...]"
             " [--next --agent ID [POLICY ...] -- COMMAND [ARG ...]]\n",
             program);
+}
+
+static int parse_shell_policy(const char *value,
+                              enum detector_shell_policy *policy)
+{
+    if (!strcmp(value, "deny"))
+        *policy = DETECTOR_SHELL_DENY;
+    else if (!strcmp(value, "audit"))
+        *policy = DETECTOR_SHELL_AUDIT;
+    else if (!strcmp(value, "allow"))
+        *policy = DETECTOR_SHELL_ALLOW;
+    else
+        return -1;
+    return 0;
 }
 
 static int parse_agents(int argc, char **argv, struct agent_process *agents,
@@ -516,9 +534,17 @@ static int parse_agents(int argc, char **argv, struct agent_process *agents,
         option_index = index + 2;
         while (option_index < argc && strcmp(argv[option_index], "--")) {
             if (!strcmp(argv[option_index], "--deny-shell")) {
-                if (agents[count].deny_shell)
+                if (agents[count].shell_policy_set)
                     return -1;
-                agents[count].deny_shell = 1;
+                agents[count].shell_policy = DETECTOR_SHELL_DENY;
+                agents[count].shell_policy_set = 1;
+            } else if (!strcmp(argv[option_index], "--shell-policy")) {
+                if (agents[count].shell_policy_set ||
+                    option_index + 1 >= argc ||
+                    parse_shell_policy(argv[++option_index],
+                                       &agents[count].shell_policy))
+                    return -1;
+                agents[count].shell_policy_set = 1;
             } else if (!strcmp(argv[option_index], "--sensitive-path")) {
                 if (agents[count].sensitive_path ||
                     option_index + 1 >= argc)
@@ -529,6 +555,13 @@ static int parse_agents(int argc, char **argv, struct agent_process *agents,
                     option_index + 1 >= argc)
                     return -1;
                 agents[count].workspace_path = argv[++option_index];
+            } else if (!strcmp(argv[option_index], "--runtime-path")) {
+                if (agents[count].runtime_path_count >=
+                        DETECTOR_MAX_RUNTIME_DIRS ||
+                    option_index + 1 >= argc)
+                    return -1;
+                agents[count].runtime_paths[agents[count].runtime_path_count++] =
+                    argv[++option_index];
             } else if (!strcmp(argv[option_index],
                                "--failed-open-threshold")) {
                 unsigned long value;
@@ -667,9 +700,11 @@ int main(int argc, char **argv)
     resource_sampler_init(&resource_sampler);
     for (index = 0; index < agent_count; index++) {
         if (detector_add_agent(&detector, agents[index].agent_id,
-                               agents[index].deny_shell,
+                               agents[index].shell_policy,
                                agents[index].sensitive_path,
                                agents[index].workspace_path,
+                               agents[index].runtime_paths,
+                               agents[index].runtime_path_count,
                                agents[index].failed_open_threshold,
                                agents[index].failed_open_window_ms,
                                agents[index].cpu_threshold_percent)) {

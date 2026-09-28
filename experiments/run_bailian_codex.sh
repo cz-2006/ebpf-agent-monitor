@@ -33,7 +33,7 @@ if [[ ! -x "$codex_bin" ]]; then
     exit 127
 fi
 
-bailian_model="${BAILIAN_MODEL:-qwen3.8-max-0902}"
+bailian_model="${BAILIAN_MODEL:-qwen3.8-27b}"
 bailian_base_url="${BAILIAN_BASE_URL%/}"
 
 # These restrictions keep command-line TOML overrides well formed.

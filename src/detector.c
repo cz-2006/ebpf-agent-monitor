@@ -35,20 +35,25 @@ static int normalize_policy_dir(char *destination, size_t size,
 }
 
 int detector_add_agent(struct detector *detector, __u32 agent_id,
-                       int deny_shell, const char *sensitive_path,
+                       enum detector_shell_policy shell_policy,
+                       const char *sensitive_path,
                        const char *workspace_path,
+                       const char *const runtime_paths[],
+                       size_t runtime_path_count,
                        __u32 failed_open_threshold,
                        __u32 failed_open_window_ms,
                        __u32 cpu_threshold_percent)
 {
     struct detector_agent_policy *policy;
+    size_t index;
 
-    if (detector->policy_count >= DETECTOR_MAX_AGENTS)
+    if (detector->policy_count >= DETECTOR_MAX_AGENTS ||
+        runtime_path_count > DETECTOR_MAX_RUNTIME_DIRS)
         return -1;
 
     policy = &detector->policies[detector->policy_count];
     policy->agent_id = agent_id;
-    policy->deny_shell = deny_shell;
+    policy->shell_policy = shell_policy;
     policy->failed_open_threshold = failed_open_threshold;
     policy->failed_open_window_ms = failed_open_window_ms;
     policy->cpu_threshold_percent = cpu_threshold_percent;
@@ -62,6 +67,13 @@ int detector_add_agent(struct detector *detector, __u32 agent_id,
                              sizeof(policy->workspace_dir),
                              workspace_path))
         return -1;
+    for (index = 0; index < runtime_path_count; index++) {
+        if (normalize_policy_dir(policy->runtime_dirs[index],
+                                 sizeof(policy->runtime_dirs[index]),
+                                 runtime_paths[index]))
+            return -1;
+    }
+    policy->runtime_dir_count = runtime_path_count;
     detector->policy_count++;
     return 0;
 }
@@ -119,8 +131,23 @@ static void detect_unexpected_shell(
 {
     const struct monitor_event_header *header = &event->header;
 
-    if (!policy->deny_shell || !is_shell(event->payload.filename))
+    if (!is_shell(event->payload.filename) ||
+        policy->shell_policy == DETECTOR_SHELL_DISABLED ||
+        policy->shell_policy == DETECTOR_SHELL_ALLOW)
         return;
+
+    if (policy->shell_policy == DETECTOR_SHELL_AUDIT) {
+        printf("timestamp_ns=%" PRIu64
+               " event=activity_evidence rule=shell_execution"
+               " pid=%u tid=%u agent_id=%u cgroup_id=%" PRIu64
+               " target=%.*s policy=shell_audit"
+               " evidence=exec_attempt,cgroup_attribution\n",
+               (uint64_t)header->timestamp_ns, header->pid, header->tid,
+               header->agent_id, (uint64_t)header->cgroup_id,
+               EVENT_FILENAME_LEN, event->payload.filename);
+        fflush(stdout);
+        return;
+    }
 
     printf("timestamp_ns=%" PRIu64
            " event=security_alert severity=high rule=unexpected_shell"
@@ -163,6 +190,7 @@ static void detect_outside_workspace_delete(
     const struct monitor_event_header *header = &event->header;
     char target[EVENT_FILENAME_LEN * 2 + 2];
     size_t directory_length;
+    size_t index;
     int written;
 
     if (!policy->workspace_dir[0] ||
@@ -179,6 +207,20 @@ static void detect_outside_workspace_delete(
     if (written < 0 || (size_t)written >= sizeof(target) ||
         path_in_directory(target, policy->workspace_dir))
         return;
+
+    for (index = 0; index < policy->runtime_dir_count; index++) {
+        if (!path_in_directory(target, policy->runtime_dirs[index]))
+            continue;
+        printf("timestamp_ns=%" PRIu64
+               " event=activity_evidence rule=runtime_file_delete"
+               " pid=%u tid=%u agent_id=%u cgroup_id=%" PRIu64
+               " target=%s policy=runtime_delete_audit"
+               " evidence=unlink_attempt,path_policy,cgroup_attribution\n",
+               (uint64_t)header->timestamp_ns, header->pid, header->tid,
+               header->agent_id, (uint64_t)header->cgroup_id, target);
+        fflush(stdout);
+        return;
+    }
 
     printf("timestamp_ns=%" PRIu64
            " event=security_alert severity=high"
