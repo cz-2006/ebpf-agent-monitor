@@ -540,6 +540,44 @@ cgroup 对 FILE_OPEN 计数，只保留第 1 次及之后每隔 N 次的真实�
 paired_overhead_median_percent 是每一对先计算开销后得到的中位数；p25/p75 区间
 反映中间 50% 样本的波动。虚拟机结果仍只用于开发阶段判断。
 
+### 推荐部署配置性能复测
+
+推荐配置同时启用 process、file、network，使用 FILE_OPEN N=100 抽样和
+`--quiet-events`，默认完成 15 对样本。奇偶样本交替采用 baseline-first 与
+monitored-first，减小固定执行顺序带来的系统温度和调度偏差：
+
+```bash
+./experiments/run_recommended_performance.sh
+```
+
+可通过 `PERF_RUNS=30` 增加样本数。结果仍属于 VirtualBox 端到端测量，不能代替
+真实 Linux 机器或比赛环境的性能结论。
+
+当前 VirtualBox 15 对实测的逐对总开销中位数为 41.52%，p25/p75 为
+39.89%/55.94%；CPU、文件、网络和进程阶段逐对中位数分别为 2.82%、271.81%、
+517.24% 和 24.89%。该高事件密度微基准中，完整推荐配置未达到 5%，主要热点为
+逐连接网络事件和进程事件。此结果不直接等同于真实 Agent 的平均开销。
+
+### Agent 风格代表性负载
+
+为了与高密度微基准对照，`agent_like_performance_workload.py` 使用 4 个确定性的
+“思考—行动”周期，每轮执行本地计算、25 次工作区文件读取、2 次本地连接、2 个
+工具子进程和 0.5 秒等待。推荐配置仍启用三类事件、FILE_OPEN N=100 和
+quiet-events，默认完成 15 对交替顺序样本：
+
+```bash
+./experiments/run_agent_like_performance.sh
+```
+
+报告中的 `total` 包含约 2 秒模拟等待，表示端到端影响；`active` 排除等待，表示
+各类实际操作的累计影响。两者应同时报告，不能只用等待稀释后的 total 宣称低开销。
+
+当前 VirtualBox 15 对实测中，total 逐对开销中位数为 0.98%，p25/p75 为
+-5.60%/4.49%；active 逐对中位数为 8.80%，p25/p75 为 -3.94%/27.88%。文件和
+网络阶段逐对中位数分别为 199.76% 和 374.37%，但基线绝对耗时仅约 1.0 ms 和
+1.6 ms。结果表明代表性低密度任务的端到端影响被等待时间显著摊薄，而活跃采集
+成本及虚拟机波动仍不可忽略，不能据 total 单项宣称采集性能达到 5%。
+
 ## 使用阿里云百炼 Qwen 运行真实 Codex Agent
 
 experiments/run_bailian_codex.sh 使用 Codex CLI 作为本地 Agent harness，

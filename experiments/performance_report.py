@@ -5,16 +5,29 @@ import statistics
 import sys
 from pathlib import Path
 
-PHASES = ("total_ns", "cpu_ns", "file_ns", "network_ns", "process_ns")
+PHASE_ORDER = (
+    "total_ns",
+    "active_ns",
+    "wait_ns",
+    "cpu_ns",
+    "file_ns",
+    "network_ns",
+    "process_ns",
+)
 
 
 def read_results(path: Path) -> dict[str, list[int]]:
-    values = {phase: [] for phase in PHASES}
+    values: dict[str, list[int]] = {}
     for line in path.read_text(encoding="utf-8").splitlines():
         fields = dict(field.split("=", 1) for field in line.split())
-        for phase in PHASES:
+        phases = {name for name in fields if name.endswith("_ns")}
+        if not values:
+            values = {phase: [] for phase in PHASE_ORDER if phase in phases}
+        if phases.intersection(PHASE_ORDER) != set(values):
+            raise ValueError(f"inconsistent timing fields in {path}")
+        for phase in values:
             values[phase].append(int(fields[phase]))
-    if not values["total_ns"]:
+    if not values or not values.get("total_ns"):
         raise ValueError(f"no results in {path}")
     return values
 
@@ -38,7 +51,10 @@ def main() -> None:
         raise SystemExit("baseline and monitored run counts differ")
 
     print(f"runs={len(baseline['total_ns'])}")
-    for phase in PHASES:
+    if set(baseline) != set(monitored):
+        raise SystemExit("baseline and monitored timing fields differ")
+
+    for phase in baseline:
         base_median = statistics.median(baseline[phase]) / 1_000_000
         monitored_median = statistics.median(monitored[phase]) / 1_000_000
         overhead = (monitored_median / base_median - 1.0) * 100.0
