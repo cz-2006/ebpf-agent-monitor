@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# 固定 FILE_OPEN N=100，增加配对次数以观察测量波动和稳定性。
 set -euo pipefail
 
 PERF_RUNS=15

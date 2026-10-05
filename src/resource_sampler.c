@@ -6,6 +6,11 @@
 
 #include "resource_sampler.h"
 
+/*
+ * 资源采样控制面：周期读取 cgroup v2 的 cpu.stat。百分比以一个逻辑 CPU
+ * 为 100% 计算，因此多线程 Agent 在多核机器上理论上可能超过 100%。
+ */
+
 static int monotonic_ns(__u64 *timestamp_ns)
 {
     struct timespec now;
@@ -69,6 +74,7 @@ int resource_sampler_add_agent(struct resource_sampler *sampler,
     return 0;
 }
 
+/* 第一次读取只建立基线；后续样本用 CPU 增量/墙钟增量计算利用率。 */
 static void collect(struct resource_sampler_agent *agent, int force,
                     resource_sample_callback callback, void *context)
 {

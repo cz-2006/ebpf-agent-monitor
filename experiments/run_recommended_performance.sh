@@ -1,4 +1,6 @@
 #!/usr/bin/env bash
+# 测量推荐运行配置：三类事件、FILE_OPEN N=100、关闭普通事件展示。
+# 每对交替基线/监控顺序，并由 performance_report.py 汇总分位数。
 set -euo pipefail
 
 script_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"

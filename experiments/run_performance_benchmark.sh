@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# 分别启用 process/file/network/all，定位高密度微基准中的主要开销来源。
 set -euo pipefail
 
 PERF_RUNS=5

@@ -1,3 +1,5 @@
+# libbpf CO-RE 构建链：生成 vmlinux.h -> 编译 BPF 对象 -> 生成 skeleton
+# -> 编译并链接用户态监控器。build/ 全部是可再生文件，不应手工修改。
 BUILD_DIR := build
 INCLUDE_DIR := include
 SRC_DIR := src

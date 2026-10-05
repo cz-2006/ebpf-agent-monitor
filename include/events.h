@@ -1,6 +1,14 @@
 #ifndef EBPF_AGENT_MONITOR_EVENTS_H
 #define EBPF_AGENT_MONITOR_EVENTS_H
 
+/*
+ * 内核态与用户态共享的二进制事件协议。
+ *
+ * monitor.bpf.c 按这些结构向 Ring Buffer 写入事件，monitor.c 再根据
+ * monitor_event_header.event_type 和 size 做严格分派。因此这里只能追加兼容
+ * 字段或同步修改两端，不能单独改变结构布局。
+ */
+
 /* eBPF 侧的 vmlinux.h 已定义整数类型；用户态才需要 linux/types.h。 */
 #ifndef __VMLINUX_H__
 #include <linux/types.h>

@@ -1,4 +1,6 @@
 #!/usr/bin/env bash
+# 简单真实 Agent 演示：启动一个百炼 Codex Agent 读取测试敏感文件，
+# 验证注册、真实路径、告警、模型响应和 cgroup 排空退出。
 set -uo pipefail
 
 script_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"

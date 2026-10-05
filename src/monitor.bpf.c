@@ -7,9 +7,17 @@
 
 #include "events.h"
 
+/*
+ * eBPF 数据面：只观测已登记 Agent cgroup 中的进程、文件和网络行为，
+ * 将固定格式事件写入 Ring Buffer。策略匹配和跨事件状态机留在用户态，
+ * 以控制 verifier 复杂度并便于调整规则。
+ */
+
 char LICENSE[] SEC("license") = "GPL";
 
 const volatile __u32 file_open_sample_every = 1;
+
+/* 该 rodata 参数由用户态在加载前设置；1 表示不抽样。 */
 
 /* 内核态通过 Ring Buffer 把事件发送给用户态。 */
 struct {
@@ -108,7 +116,7 @@ int handle_execve(struct trace_event_raw_sys_enter *ctx)
     return 0;
 }
 
-
+/* sched tracepoint 已确认 fork 成功，适合记录父子关系。 */
 SEC("tracepoint/sched/sched_process_fork")
 int handle_process_fork(struct trace_event_raw_sched_process_fork *ctx)
 {
@@ -154,6 +162,7 @@ int handle_process_fork(struct trace_event_raw_sched_process_fork *ctx)
     return 0;
 }
 
+/* 退出事件来自当前 task；exit_code_raw 保留内核原值供用户态解释。 */
 SEC("tracepoint/sched/sched_process_exit")
 int handle_process_exit(struct trace_event_raw_sched_process_template *ctx)
 {
@@ -195,7 +204,10 @@ int handle_process_exit(struct trace_event_raw_sched_process_template *ctx)
     return 0;
 }
 
-
+/*
+ * LSM file_open 能拿到 struct file，因此可用 bpf_d_path 得到内核解析后的
+ * 真实路径；它不覆盖“路径不存在”这种尚未形成 file 的失败打开。
+ */
 SEC("lsm/file_open")
 int BPF_PROG(handle_file_open, struct file *file, int ret)
 {
@@ -253,6 +265,7 @@ int BPF_PROG(handle_file_open, struct file *file, int ret)
     return 0;
 }
 
+/* path_unlink 在删除发生前触发；事件表示尝试，不能单独证明删除成功。 */
 SEC("lsm/path_unlink")
 int BPF_PROG(handle_path_unlink, const struct path *dir,
              struct dentry *dentry, int ret)
@@ -309,6 +322,10 @@ int BPF_PROG(handle_path_unlink, const struct path *dir,
 }
 
 
+/*
+ * openat 入口/返回配对补足 LSM 看不到的失败打开。入口复制用户路径，避免
+ * 返回时用户指针内容已经变化；key 使用 pid_tgid，避免线程互相覆盖。
+ */
 SEC("tracepoint/syscalls/sys_enter_openat")
 int handle_openat_enter(struct trace_event_raw_sys_enter *ctx)
 {
@@ -336,6 +353,7 @@ int handle_openat_enter(struct trace_event_raw_sys_enter *ctx)
     return 0;
 }
 
+/* 当前只提交 ret < 0 的结果，供重复失败规则使用并减少正常打开噪声。 */
 SEC("tracepoint/syscalls/sys_exit_openat")
 int handle_openat_exit(struct trace_event_raw_sys_exit *ctx)
 {
@@ -384,6 +402,7 @@ int handle_openat_exit(struct trace_event_raw_sys_exit *ctx)
     return 0;
 }
 
+/* connect 的 sockaddr 只在入口可靠，先解析并暂存目标地址和端口。 */
 SEC("tracepoint/syscalls/sys_enter_connect")
 int handle_connect_enter(struct trace_event_raw_sys_enter *ctx)
 {
@@ -436,6 +455,7 @@ int handle_connect_enter(struct trace_event_raw_sys_enter *ctx)
     return 0;
 }
 
+/* 返回点补上结果码后再提交完整 CONNECT_RESULT。 */
 SEC("tracepoint/syscalls/sys_exit_connect")
 int handle_connect_exit(struct trace_event_raw_sys_exit *ctx)
 {

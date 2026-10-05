@@ -1,4 +1,6 @@
 #!/usr/bin/env bash
+# 全面真实 Agent 演示：并发启动两个百炼 Codex Agent，分别触发敏感读取、
+# 工作区外删除、Shell 审计和网络事件，并自动核对关键证据。
 set -uo pipefail
 
 script_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"

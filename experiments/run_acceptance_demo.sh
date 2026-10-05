@@ -1,4 +1,6 @@
 #!/usr/bin/env bash
+# 一键启动两个确定性工作负载，收集日志并核对基础验收项。
+# 脚本自身以普通用户运行，仅在加载 monitor 时调用 sudo。
 set -uo pipefail
 
 script_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"

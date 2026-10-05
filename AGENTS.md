@@ -1,6 +1,6 @@
 # 项目长期上下文
 
-更新时间：2026-09-28
+更新时间：2026-09-29
 
 ## 项目与资料
 
@@ -157,6 +157,21 @@ HTTPS 明文采集是后期研究方向。OpenSSL 的 SSL_read/SSL_write 仅是�
 3. 整理演示讲解与已知限制，明确受控脚本证据、真实 Agent 证据和性能数据的边界。
 4. 如仍有时间，再选择补充 openat2/unlinkat/rename、压力与事件丢失测试，或真实 Linux/5.15 性能复测。
 5. 基础交付稳定后，再研究 HTTPS 明文、Prompt/Response 关联及多智能体协作/竞争异常。
+
+- 2026-09-29 用户指出对现有架构和代码理解不足，项目进入学习与交付优先阶段；
+  design.md 的性能摘要同步为最新两类基准结果。此前的临时教学导读已按用户要求删除，
+  不再作为仓库交付文件。
+
+- 2026-09-29 已为项目维护的正式 C/eBPF 源码、共享头文件、Makefile 和全部 Shell
+  运行脚本补充模块职责及关键设计注释；Python 与 bpftrace 实验保留并复核原有用途
+  说明。注释重点解释事件协议、入口/返回配对、真实路径边界、两阶段门控、cgroup
+  排空、规则证据和性能脚本方法，不添加逐行翻译式噪声。`make`、全部 Python
+  `py_compile`、Shell `bash -n` 与 `git diff --check` 均通过。
+
+- 2026-09-29 新增 `docs/architecture-diagram.md`，用 Mermaid 汇总完整正式架构：
+  用户态受控启动与生命周期、每 Agent 独立 cgroup、eBPF 进程/文件/网络观测点、
+  BPF maps、Ring Buffer、Collector、CPU 采样、Detector、五类规则和结构化输出；
+  README 已增加入口。图中明确排除尚未实现的进阶能力。
 
 - 2026-09-29 用户选择复测实际推荐性能配置。新增
   `experiments/run_recommended_performance.sh`：同时启用 process/file/network，

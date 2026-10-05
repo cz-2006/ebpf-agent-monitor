@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# 比较 FILE_OPEN 每 1/10/100 次采样时的端到端微基准开销。
 set -euo pipefail
 
 PERF_RUNS=5

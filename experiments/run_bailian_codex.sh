@@ -1,4 +1,6 @@
 #!/usr/bin/env bash
+# 用 OpenAI 兼容接口启动百炼模型支持的 Codex CLI。
+# 凭据只从环境变量读取，绝不写入仓库或 Codex 配置文件。
 set -euo pipefail
 
 script_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"

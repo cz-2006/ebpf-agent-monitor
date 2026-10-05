@@ -4,6 +4,7 @@
 赛题基础要求的实测证据、缺口与后续验证顺序见
 [验收证据清单](docs/acceptance-status.md)。架构、事件语义、策略设计、验证结果和
 扩展边界集中说明于[系统设计与实现说明](docs/design.md)。
+需要快速查看系统各模块及数据流时，请打开[项目整体架构图](docs/architecture-diagram.md)。
 
 ## 当前正式原型
 

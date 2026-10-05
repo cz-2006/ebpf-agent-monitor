@@ -1,4 +1,6 @@
 #!/usr/bin/env bash
+# 交替运行基线与受监控的 Agent 风格低密度负载，减少顺序漂移偏差。
+# 输出既包含等待时间的 total，也包含排除等待的 active 指标。
 set -euo pipefail
 
 script_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"

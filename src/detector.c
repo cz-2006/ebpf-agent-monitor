@@ -8,6 +8,11 @@
 
 #include "detector.h"
 
+/*
+ * 用户态规则引擎。每个 Agent 拥有独立策略和重复失败状态；所有输出都保留
+ * agent_id、cgroup_id、PID/TID、目标及 evidence，便于从告警回溯原始事件。
+ */
+
 void detector_init(struct detector *detector)
 {
     memset(detector, 0, sizeof(*detector));
@@ -125,6 +130,7 @@ static int path_in_directory(const char *path, const char *directory)
            !strncmp(path, directory, directory_length - 1);
 }
 
+/* Shell 策略支持 disabled/allow/audit/deny，便于真实 Agent 降噪。 */
 static void detect_unexpected_shell(
     const struct detector_agent_policy *policy,
     const struct exec_event *event)
@@ -160,6 +166,7 @@ static void detect_unexpected_shell(
     fflush(stdout);
 }
 
+/* 只把敏感目录中的可读打开视为读取证据，排除纯写和目录遍历。 */
 static void detect_sensitive_file_access(
     const struct detector_agent_policy *policy,
     const struct file_open_event *event)
@@ -183,6 +190,7 @@ static void detect_sensitive_file_access(
     fflush(stdout);
 }
 
+/* 区分业务工作区外删除和 Codex/bwrap 自身运行时清理。 */
 static void detect_outside_workspace_delete(
     const struct detector_agent_policy *policy,
     const struct file_unlink_event *event)
@@ -233,6 +241,7 @@ static void detect_outside_workspace_delete(
     fflush(stdout);
 }
 
+/* 词法消解 . 和 ..；不访问文件系统，也不把结果冒充 realpath。 */
 static int normalize_absolute_path(const char *input, char *output,
                                    size_t output_size)
 {
@@ -285,6 +294,10 @@ static int normalize_absolute_path(const char *input, char *output,
     return 0;
 }
 
+/*
+ * 对失败 openat 只能重建“尝试路径”：绝对路径直接使用，相对路径需依赖
+ * /proc/<pid>/cwd。该结果在告警中明确标为 reconstructed_attempt。
+ */
 static int reconstruct_attempted_path(const struct file_open_result_event *event,
                                       char *output, size_t output_size,
                                       const char **reconstruction)
@@ -324,6 +337,7 @@ static int reconstruct_attempted_path(const struct file_open_result_event *event
     return normalize_absolute_path(combined, output, output_size);
 }
 
+/* 为 (agent_id, target) 找到现有窗口，或复用最旧槽位。 */
 static struct failed_open_state *
 failed_open_state(struct detector *detector, __u32 agent_id,
                   const char *path, __u64 timestamp_ns)
@@ -362,6 +376,7 @@ failed_open_state(struct detector *detector, __u32 agent_id,
     return free_state;
 }
 
+/* 同 Agent、同目标、时间窗内达到阈值时只产生一次活动告警。 */
 static void detect_repeated_failed_open(
     struct detector *detector,
     const struct detector_agent_policy *policy,
@@ -497,6 +512,7 @@ void detector_process_cpu_sample(
     fflush(stdout);
 }
 
+/* 按事件类型分派；无关事件不会改变检测器状态。 */
 void detector_process(struct detector *detector, const void *data,
                       size_t size)
 {

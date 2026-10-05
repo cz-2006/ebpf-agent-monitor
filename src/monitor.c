@@ -20,6 +20,12 @@
 #include "events.h"
 #include "monitor.skel.h"
 
+/*
+ * 用户态控制面与 Collector：解析多个 Agent 配置、加载并附加 BPF、创建
+ * 独立 cgroup、以 sudo 调用者身份受控启动目标、消费 Ring Buffer、驱动
+ * detector/CPU sampler，并在根进程退出后等待整个 cgroup 排空。
+ */
+
 #define CGROUP_BASE "/sys/fs/cgroup/ebpf-agent-monitor"
 #define MAX_AGENTS 16
 #define EVENT_MASK_PROCESS (1U << 0)
@@ -40,6 +46,7 @@ struct run_identity {
 };
 
 struct agent_process {
+    /* 一条 --agent 配置在启动、运行和清理阶段需要保留的全部状态。 */
     __u32 agent_id;
     __u64 cgroup_id;
     char cgroup_path[PATH_MAX];
@@ -106,6 +113,7 @@ static int on_event(void *ctx, void *data, size_t size)
         return 0;
     }
 
+    /* size 双重校验防止协议版本不一致时按错误结构读取 Ring Buffer。 */
     switch (h->event_type) {
     case EVENT_EXEC_ATTEMPT: {
         const struct exec_event *event = data;
@@ -275,6 +283,7 @@ static int read_sudo_identity(struct run_identity *identity)
     return 0;
 }
 
+/* 将 process,file,network 列表转换为探针自动加载位图。 */
 static int parse_event_mask(const char *text, unsigned int *mask)
 {
     char copy[64];
@@ -402,6 +411,7 @@ static int move_and_verify(const char *path, pid_t pid)
     return -1;
 }
 
+/* cgroup.events 的 populated=0 才表示根进程及其所有后代都已退出。 */
 static int cgroup_is_populated(const char *path, int *populated)
 {
     char file_path[PATH_MAX];
@@ -433,6 +443,11 @@ static int cgroup_is_populated(const char *path, int *populated)
 /*
  * 第一阶段在原 cgroup 中完成可能访问 NSS/组文件的 initgroups；
  * 第二阶段等待父进程迁移并登记 cgroup 后，再放弃 root 并 exec。
+ */
+/*
+ * 两阶段门控：先在原 cgroup 完成 initgroups 并通知父进程；父进程迁移、
+ * 注册映射后放行；子进程再永久降权并 exec。这样既不会漏掉首个业务 exec，
+ * 也不会把 root 身份的 NSS 准备访问归入 Agent。
  */
 static void prepared_gated_exec(int gate_fd, int ready_fd, char **command,
                                 const struct run_identity *identity)
