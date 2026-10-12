@@ -13,19 +13,25 @@
  * 以控制 verifier 复杂度并便于调整规则。
  */
 
+/* GPL 许可证使程序可以调用受 GPL 限制的 BPF helper，例如 bpf_d_path。 */
 char LICENSE[] SEC("license") = "GPL";
 
+/* 该只读配置由 skeleton 在加载前写入；1 表示每次 FILE_OPEN 都采集。 */
 const volatile __u32 file_open_sample_every = 1;
 
-/* 该 rodata 参数由用户态在加载前设置；1 表示不抽样。 */
-
-/* 内核态通过 Ring Buffer 把事件发送给用户态。 */
+/*
+ * 内核态通过 Ring Buffer 把事件发送给用户态。256 KiB 是共享缓冲区容量，
+ * reserve 失败时当前事件会被丢弃，但不会阻塞被监控进程。
+ */
 struct {
     __uint(type, BPF_MAP_TYPE_RINGBUF);
     __uint(max_entries, 256 * 1024);
 } events SEC(".maps");
 
-/* 受控启动器预先注册 cgroup；未注册 cgroup 的事件直接忽略。 */
+/*
+ * 受控启动器预先注册 cgroup；未注册 cgroup 的事件在每个探针开头直接忽略。
+ * 这既完成 Agent 归属，也从内核源头过滤终端、VS Code 和系统服务等噪声。
+ */
 struct {
     __uint(type, BPF_MAP_TYPE_HASH);
     __uint(max_entries, 128);
@@ -37,10 +43,10 @@ struct {
 #define MONITOR_AF_INET6 10
 
 struct pending_openat {
-    __u64 cgroup_id;
+    __u64 cgroup_id; /* 入口时保存，避免返回前映射被用户态删除。 */
     __u32 agent_id;
-    __s32 dirfd;
-    char attempted_path[EVENT_FILENAME_LEN];
+    __s32 dirfd;     /* AT_FDCWD 或作为相对路径基准的目录 fd。 */
+    char attempted_path[EVENT_FILENAME_LEN]; /* syscall 原始字符串的入口副本。 */
 };
 
 /* openat 入口保存用户指针内容；返回点只提交失败结果。 */
@@ -55,8 +61,8 @@ struct pending_connect {
     __u64 cgroup_id;
     __u32 agent_id;
     __s32 socket_fd;
-    __u16 family;
-    __u16 destination_port;
+    __u16 family; /* 只接受 IPv4/IPv6，其他 sockaddr 类型不提交。 */
+    __u16 destination_port; /* 入口时转换为主机字节序。 */
     __u8 destination_address[16];
 };
 
@@ -79,6 +85,7 @@ int handle_execve(struct trace_event_raw_sys_enter *ctx)
     __u64 pid_tgid;
     __u64 uid_gid;
 
+    /* execve 入口仍属于旧进程映像，因此 comm 可能还是 monitor 或 bash。 */
     cgroup_id = bpf_get_current_cgroup_id();
     agent = bpf_map_lookup_elem(&agent_by_cgroup, &cgroup_id);
     if (!agent)
@@ -154,6 +161,7 @@ int handle_process_fork(struct trace_event_raw_sched_process_fork *ctx)
 
     event->payload.parent_pid = ctx->parent_pid;
     event->payload.child_pid = ctx->child_pid;
+    /* __data_loc 的低 16 位是动态字符串相对 tracepoint 记录的偏移。 */
     bpf_probe_read_kernel_str(
         event->payload.child_comm, sizeof(event->payload.child_comm),
         (const char *)ctx + (ctx->__data_loc_child_comm & 0xffff));
@@ -231,6 +239,7 @@ int BPF_PROG(handle_file_open, struct file *file, int ret)
     if (file_open_sample_every > 1) {
         __u64 sequence;
 
+        /* 原子递增保证同一 cgroup 内并发线程不会使用重复序号。 */
         sequence = __sync_fetch_and_add(&agent->file_open_count, 1);
         if (sequence % file_open_sample_every)
             return 0;
@@ -256,6 +265,7 @@ int BPF_PROG(handle_file_open, struct file *file, int ret)
     event->header.agent_id = agent->agent_id;
     bpf_get_current_comm(event->header.comm, sizeof(event->header.comm));
 
+    /* CO-RE 访问允许字段偏移在不同内核版本上由 libbpf 重定位。 */
     event->payload.flags = BPF_CORE_READ(file, f_flags);
     path_ret = bpf_d_path((struct path *)&file->f_path, event->payload.path,
                           sizeof(event->payload.path));
@@ -280,6 +290,7 @@ int BPF_PROG(handle_path_unlink, const struct path *dir,
     long path_ret;
     long name_ret;
 
+    /* 和 file_open 一样，本程序是观察器，不覆盖更早安全模块的决定。 */
     if (ret)
         return ret;
 
@@ -312,6 +323,7 @@ int BPF_PROG(handle_path_unlink, const struct path *dir,
                           sizeof(event->payload.dir_path));
     event->payload.path_ret = (__s32)path_ret;
 
+    /* hook 分开提供父目录 path 与目标 dentry，完整路径由用户态拼接。 */
     name = BPF_CORE_READ(dentry, d_name.name);
     name_ret = bpf_probe_read_kernel_str(event->payload.name,
                                          sizeof(event->payload.name), name);
@@ -349,6 +361,7 @@ int handle_openat_enter(struct trace_event_raw_sys_enter *ctx)
     pending.agent_id = agent->agent_id;
     pending.dirfd = (__s32)ctx->args[0];
     pid_tgid = bpf_get_current_pid_tgid();
+    /* BPF_ANY 允许覆盖同一线程异常遗留的旧入口，避免状态永久失配。 */
     bpf_map_update_elem(&pending_openats, &pid_tgid, &pending, BPF_ANY);
     return 0;
 }
@@ -371,6 +384,7 @@ int handle_openat_exit(struct trace_event_raw_sys_exit *ctx)
 
     __builtin_memcpy(&saved, pending, sizeof(saved));
     bpf_map_delete_elem(&pending_openats, &pid_tgid);
+    /* 成功打开将由 LSM FILE_OPEN 提供真实路径，此处不重复上报。 */
     if (ctx->ret >= 0)
         return 0;
 
@@ -433,6 +447,7 @@ int handle_connect_enter(struct trace_event_raw_sys_enter *ctx)
 
         if (bpf_probe_read_user(&address, sizeof(address), user_address) < 0)
             return 0;
+        /* sockaddr 端口为网络字节序，日志统一保存为主机字节序。 */
         pending.destination_port = bpf_ntohs(address.sin_port);
         __builtin_memcpy(pending.destination_address,
                          &address.sin_addr.s_addr,
@@ -495,6 +510,7 @@ int handle_connect_exit(struct trace_event_raw_sys_exit *ctx)
     bpf_get_current_comm(event->header.comm, sizeof(event->header.comm));
 
     event->payload.socket_fd = saved.socket_fd;
+    /* 非阻塞 connect 常见 -EINPROGRESS；它表示仍在进行，并非最终失败。 */
     event->payload.ret = (__s32)ctx->ret;
     event->payload.family = saved.family;
     event->payload.destination_port = saved.destination_port;

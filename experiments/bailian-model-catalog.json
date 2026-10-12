@@ -1,9 +1,9 @@
 {
   "models": [
     {
-      "slug": "qwen3.8-27b",
-      "display_name": "qwen3.8-27b",
-      "description": "Alibaba Cloud Model Studio Qwen 3.8 27B",
+      "slug": "qwen3.8-flash",
+      "display_name": "qwen3.8-flash",
+      "description": "Alibaba Cloud Model Studio Qwen 3.8 Flash",
       "default_reasoning_level": "low",
       "supported_reasoning_levels": [
         {"effort": "low", "description": "Fast responses with lighter reasoning"},

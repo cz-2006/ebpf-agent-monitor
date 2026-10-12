@@ -38,6 +38,7 @@ static int hide_runtime_noise;
 static unsigned int event_mask = EVENT_MASK_ALL;
 static __u32 file_open_sample_every = 1;
 
+/* sudo 调用者的普通用户身份；受控子进程最终切换到这组凭据。 */
 struct run_identity {
     uid_t uid;
     gid_t gid;
@@ -47,13 +48,13 @@ struct run_identity {
 
 struct agent_process {
     /* 一条 --agent 配置在启动、运行和清理阶段需要保留的全部状态。 */
-    __u32 agent_id;
+    __u32 agent_id; /* 用户指定的稳定业务编号。 */
     __u64 cgroup_id;
     char cgroup_path[PATH_MAX];
     char **command;
-    pid_t child;
-    int gate[2];
-    int ready[2];
+    pid_t child; /* 根进程 PID；排空报告后取负值作为已报告标记。 */
+    int gate[2];  /* 父进程完成 cgroup 登记后用于放行子进程。 */
+    int ready[2]; /* 子进程完成 initgroups 后通知父进程。 */
     int status;
     int cgroup_created;
     int registered;
@@ -72,14 +73,17 @@ struct agent_process {
     __u32 cpu_threshold_percent;
 };
 
+/* 信号处理器只设置原子标志，实际终止和清理由主循环完成。 */
 static void on_signal(int sig) { (void)sig; stop = 1; }
 
 static void on_resource_sample(void *context,
                                const struct resource_cpu_sample *sample)
 {
+    /* 回调不自行判断阈值，保持采样和规则匹配两层职责分离。 */
     detector_process_cpu_sample(context, sample);
 }
 
+/* 输出所有原始事件共有的前缀，专属载荷由 on_event 的各分支追加。 */
 static void print_header(const struct monitor_event_header *h,
                          const char *event_name)
 {
@@ -99,11 +103,16 @@ static int hide_runtime_file_event(const struct monitor_event_header *h,
     if (!strncmp(h->comm, "bwrap", EVENT_COMM_LEN) ||
         !strncmp(h->comm, "codex-linux-san", EVENT_COMM_LEN))
         return 1;
+    /* 这里只隐藏原始事件展示，不隐藏 Detector 生成的 activity_evidence。 */
     return path &&
            !strncmp(path, "/tmp/codex-bwrap-synthetic-mount-targets-",
                     sizeof("/tmp/codex-bwrap-synthetic-mount-targets-") - 1);
 }
 
+/*
+ * Ring Buffer 每收到一条完整记录便调用本函数。返回 0 表示继续消费；普通
+ * 事件是否打印由 quiet 选项决定，但规则所需的文件事件仍交给 Detector。
+ */
 static int on_event(void *ctx, void *data, size_t size)
 {
     const struct monitor_event_header *h = data;
@@ -113,7 +122,7 @@ static int on_event(void *ctx, void *data, size_t size)
         return 0;
     }
 
-    /* size 双重校验防止协议版本不一致时按错误结构读取 Ring Buffer。 */
+    /* 实际记录长度和头部自报长度都要可信，避免越界解释专属载荷。 */
     switch (h->event_type) {
     case EVENT_EXEC_ATTEMPT: {
         const struct exec_event *event = data;
@@ -236,6 +245,7 @@ static int on_event(void *ctx, void *data, size_t size)
     return 0;
 }
 
+/* 十进制无符号参数的统一严格解析：拒绝空串、尾随字符和范围错误。 */
 static int parse_unsigned(const char *text, unsigned long *value)
 {
     char *end;
@@ -264,6 +274,7 @@ static int read_sudo_identity(struct run_identity *identity)
         return -1;
     }
 
+    /* 不直接相信环境字符串，还要与 passwd 数据库中的用户名和 UID 对照。 */
     errno = 0;
     entry = getpwnam(user);
     if (!entry || entry->pw_uid != (uid_t)uid_value) {
@@ -293,6 +304,7 @@ static int parse_event_mask(const char *text, unsigned int *mask)
 
     if (!text || strlen(text) >= sizeof(copy))
         return -1;
+    /* strtok_r 会修改输入，故先复制到有明确上限的本地缓冲区。 */
     strcpy(copy, text);
     for (token = strtok_r(copy, ",", &save); token;
          token = strtok_r(NULL, ",", &save)) {
@@ -316,6 +328,10 @@ static int parse_event_mask(const char *text, unsigned int *mask)
     return 0;
 }
 
+/*
+ * 必须在 monitor_bpf__load 之前关闭未选程序的 autoload；未加载的 BPF 程序
+ * 不会附着 hook，也不会产生对应类别的内核开销或规则证据。
+ */
 static void configure_event_autoload(struct monitor_bpf *skel)
 {
     int process = !!(event_mask & EVENT_MASK_PROCESS);
@@ -333,6 +349,7 @@ static void configure_event_autoload(struct monitor_bpf *skel)
     bpf_program__set_autoload(skel->progs.handle_connect_exit, network);
 }
 
+/* Agent ID 0 保留为“未归属”，因此命令行只接受 1..UINT32_MAX。 */
 static int parse_id(const char *text, __u32 *id)
 {
     char *end;
@@ -345,6 +362,7 @@ static int parse_id(const char *text, __u32 *id)
     return 0;
 }
 
+/* 为本次 monitor 运行创建名称含 agent_id 与 monitor PID 的独立 cgroup。 */
 static int create_cgroup(char *path, size_t size, __u32 id, int *made_base)
 {
     int n;
@@ -375,6 +393,7 @@ static int cgroup_id(const char *path, __u64 *id)
     return 0;
 }
 
+/* 写 cgroup.procs 完成迁移，并重新读取核验，防止“写入未生效仍继续启动”。 */
 static int move_and_verify(const char *path, pid_t pid)
 {
     char file_path[PATH_MAX];
@@ -492,6 +511,7 @@ static void prepared_gated_exec(int gate_fd, int ready_fd, char **command,
     _exit(127);
 }
 
+/* 所有全局选项必须出现在第一个 --agent 前，每组 Agent 用 --next 分隔。 */
 static void print_usage(const char *program)
 {
     fprintf(stderr,
@@ -507,6 +527,7 @@ static void print_usage(const char *program)
             program);
 }
 
+/* 把人类可读策略名称转换为 Detector 枚举。 */
 static int parse_shell_policy(const char *value,
                               enum detector_shell_policy *policy)
 {
@@ -521,6 +542,10 @@ static int parse_shell_policy(const char *value,
     return 0;
 }
 
+/*
+ * 原地解析命令行：每个 --next 被改成 NULL，使 agent.command 可以直接交给
+ * execvp。函数同时检查重复 ID、成对阈值参数和抽样/敏感读取的语义冲突。
+ */
 static int parse_agents(int argc, char **argv, struct agent_process *agents,
                         size_t *agent_count)
 {
@@ -689,6 +714,7 @@ static int parse_agents(int argc, char **argv, struct agent_process *agents,
     return 0;
 }
 
+/* 把 waitpid 状态转换成 shell 常见结果：正常退出码或 128+signal。 */
 static int status_result(int status)
 {
     if (WIFEXITED(status))
@@ -698,6 +724,7 @@ static int status_result(int status)
     return 1;
 }
 
+/* 根进程退出不代表 Agent 完全结束，故单独报告而不注销 cgroup 映射。 */
 static void print_root_exit(const struct agent_process *agent)
 {
     if (WIFEXITED(agent->status)) {
@@ -714,6 +741,7 @@ static void print_root_exit(const struct agent_process *agent)
     fflush(stdout);
 }
 
+/* 仅 populated=0 后输出最终 agent_exit，basis 明确为整个 cgroup 排空。 */
 static void print_agent_drained(const struct agent_process *agent)
 {
     printf("event=agent_cgroup_drained agent_id=%u cgroup_id=%" PRIu64
@@ -750,12 +778,14 @@ int main(int argc, char **argv)
     int result = 1;
     int err = 0;
 
+    /* -1 表示尚无子进程或 fd，保证任意失败位置都能进入同一 cleanup。 */
     for (index = 0; index < MAX_AGENTS; index++) {
         agents[index].child = -1;
         agents[index].gate[0] = agents[index].gate[1] = -1;
         agents[index].ready[0] = agents[index].ready[1] = -1;
     }
 
+    /* 第一阶段：解析全部配置并建立纯用户态的 Detector/Sampler 状态。 */
     if (parse_agents(argc, argv, agents, &agent_count)) {
         print_usage(argv[0]);
         return 2;
@@ -776,6 +806,7 @@ int main(int argc, char **argv)
             return 1;
         }
     }
+    /* monitor 需要加载 BPF、创建 cgroup；目标 Agent 随后会降为 sudo 调用者。 */
     if (geteuid()) {
         fprintf(stderr, "controlled launch requires root privileges\n");
         return 1;
@@ -786,6 +817,10 @@ int main(int argc, char **argv)
     signal(SIGINT, on_signal);
     signal(SIGTERM, on_signal);
 
+    /*
+     * 第二阶段：open 只创建 skeleton；load 才由内核验证并加载程序；attach
+     * 把程序连接到 tracepoint/LSM。rodata 和 autoload 必须在 load 前设置。
+     */
     skel = monitor_bpf__open();
     if (skel) {
         configure_event_autoload(skel);
@@ -796,6 +831,7 @@ int main(int argc, char **argv)
         fprintf(stderr, "failed to open/load/attach BPF program: %d\n", err);
         goto cleanup;
     }
+    /* Ring Buffer callback 的 context 指向 Detector，生命周期覆盖整个消费期。 */
     rb = ring_buffer__new(bpf_map__fd(skel->maps.events),
                           on_event, &detector, NULL);
     if (!rb) {
@@ -813,6 +849,10 @@ int main(int argc, char **argv)
         char prepared;
         ssize_t count_read;
 
+        /*
+         * 先创建 cgroup 并登记 map，再 fork 门控子进程。登记早于迁移是安全的：
+         * 空 cgroup 不会产生事件；迁移后第一条业务 exec 已能正确归属。
+         */
         if (create_cgroup(agent->cgroup_path, sizeof(agent->cgroup_path),
                           agent->agent_id, &base_created))
             goto cleanup;
@@ -832,6 +872,7 @@ int main(int argc, char **argv)
         }
         agent->registered = 1;
 
+        /* O_CLOEXEC 防止两条同步管道泄漏进最终 Agent 程序。 */
         if (pipe2(agent->gate, O_CLOEXEC) ||
             pipe2(agent->ready, O_CLOEXEC) ||
             (agent->child = fork()) < 0) {
@@ -841,6 +882,7 @@ int main(int argc, char **argv)
         if (!agent->child) {
             size_t other;
 
+            /* 子进程关闭此前 Agent 的管道副本，否则会干扰 EOF 与清理语义。 */
             for (other = 0; other <= index; other++) {
                 if (other != index) {
                     if (agents[other].gate[0] >= 0)
@@ -875,6 +917,7 @@ int main(int argc, char **argv)
             goto cleanup;
         }
 
+        /* 只有孩子明确完成 initgroups 后，父进程才迁移并准备资源采样。 */
         if (move_and_verify(agent->cgroup_path, agent->child))
             goto cleanup;
         if (agent->cpu_sample_ms &&
@@ -893,6 +936,7 @@ int main(int argc, char **argv)
         fflush(stdout);
     }
 
+    /* 全部 Agent 均注册成功后再统一放行，形成尽量一致的并发起点。 */
     for (index = 0; index < agent_count; index++) {
         if (write(agents[index].gate[1], "x", 1) != 1) {
             perror("release Agent");
@@ -902,11 +946,16 @@ int main(int argc, char **argv)
         agents[index].gate[1] = -1;
     }
 
+    /*
+     * 第四阶段：同一个事件循环串行完成 Ring Buffer 消费、CPU 采样、根进程
+     * waitpid 和 cgroup 排空检查。remaining 统计尚未排空的 cgroup 数量。
+     */
     remaining = agent_count;
     while (remaining) {
         int newly_reaped = 0;
         int newly_drained = 0;
 
+        /* 100 ms 超时让主循环即使无 BPF 事件也能及时采样和处理退出。 */
         err = ring_buffer__poll(rb, 100);
         if (err < 0 && err != -EINTR) {
             fprintf(stderr, "ring buffer poll failed: %d\n", err);
@@ -933,6 +982,7 @@ int main(int argc, char **argv)
         }
 
         if (newly_reaped) {
+            /* 先消费已排队事件，再打印 root_exit，尽量保持展示上的因果顺序。 */
             (void)ring_buffer__consume(rb);
             for (index = 0; index < agent_count; index++) {
                 if (agents[index].reaped &&
@@ -943,6 +993,7 @@ int main(int argc, char **argv)
             }
         }
 
+        /* root 已回收后仍检查 populated，不能把存活后代误判为 Agent 结束。 */
         for (index = 0; index < agent_count; index++) {
             int populated;
 
@@ -958,6 +1009,7 @@ int main(int argc, char **argv)
         }
 
         if (newly_drained) {
+            /* 排空时最后消费事件、强制 CPU 采样，再发布最终生命周期记录。 */
             (void)ring_buffer__consume(rb);
             for (index = 0; index < agent_count; index++) {
                 if (!agents[index].drained || agents[index].child < 0)
@@ -971,6 +1023,7 @@ int main(int argc, char **argv)
         }
 
         if (stop && !terminate_sent) {
+            /* Ctrl-C/SIGTERM 先温和通知仍存活的根进程；cleanup 才兜底 SIGKILL。 */
             for (index = 0; index < agent_count; index++) {
                 if (!agents[index].reaped && agents[index].child > 0)
                     (void)kill(agents[index].child, SIGTERM);
@@ -979,6 +1032,7 @@ int main(int argc, char **argv)
         }
     }
 
+    /* monitor 成功完成时返回第一个非零 Agent 结果，便于 Shell/脚本发现失败。 */
     result = 0;
     for (index = 0; index < agent_count; index++) {
         int agent_result = status_result(agents[index].status);
@@ -987,6 +1041,10 @@ int main(int argc, char **argv)
     }
 
 cleanup:
+    /*
+     * 第五阶段：任何错误都走统一逆序清理。先关闭同步 fd、终止未回收根进程，
+     * 再注销 map，最后删除 cgroup 和销毁 libbpf 对象，避免留下错误归属状态。
+     */
     for (index = 0; index < agent_count; index++) {
         struct agent_process *agent = &agents[index];
         pid_t child_pid = agent->child < 0 ? -agent->child : agent->child;

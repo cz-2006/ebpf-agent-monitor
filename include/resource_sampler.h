@@ -16,25 +16,27 @@
 
 /* 相邻两次 cpu.stat 读数形成一个采样区间；10000 表示 100.00%。 */
 struct resource_cpu_sample {
-    __u32 agent_id;
-    __u64 cgroup_id;
-    __u64 timestamp_ns;
-    __u64 interval_usec;
-    __u64 usage_delta_usec;
-    __u64 cpu_percent_x100;
+    __u32 agent_id;          /* 业务 Agent 编号。 */
+    __u64 cgroup_id;         /* 与系统事件相同的归属键。 */
+    __u64 timestamp_ns;      /* 本次采样的单调时钟时间。 */
+    __u64 interval_usec;     /* 两次墙钟读数之差。 */
+    __u64 usage_delta_usec;  /* 两次 cpu.stat usage_usec 之差。 */
+    __u64 cpu_percent_x100;  /* 百分比乘 100：9657 表示 96.57%。 */
 };
 
+/* 单个 Agent 的采样基线和下一次截止时间。 */
 struct resource_sampler_agent {
-    int active;
+    int active; /* cgroup 排空并做最后采样后置 0。 */
     __u32 agent_id;
     __u64 cgroup_id;
     __u32 interval_ms;
-    __u64 previous_timestamp_ns;
-    __u64 previous_usage_usec;
-    __u64 next_sample_ns;
+    __u64 previous_timestamp_ns; /* 上次成功读取的墙钟基线。 */
+    __u64 previous_usage_usec;   /* 上次成功读取的 CPU 时间基线。 */
+    __u64 next_sample_ns;        /* 非强制采样的最早执行时间。 */
     char cpu_stat_path[PATH_MAX];
 };
 
+/* 所有 Agent 的采样状态由 monitor 主循环串行驱动，无需加锁。 */
 struct resource_sampler {
     struct resource_sampler_agent agents[RESOURCE_SAMPLER_MAX_AGENTS];
     size_t count;

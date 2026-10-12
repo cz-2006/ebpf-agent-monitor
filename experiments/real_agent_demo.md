@@ -12,7 +12,7 @@ make
 
 不要把真实 API Key 写在命令行。直接启动演示；如果当前环境没有 Key，脚本会显示
 `Bailian API Key (hidden):`，此时粘贴 Key 并回车。输入内容不会回显，也不会进入
-Shell 历史。Base URL 和模型默认分别为百炼兼容接口与 `qwen3.8-27b`，需要切换时
+Shell 历史。Base URL 和模型默认分别为百炼兼容接口与 `qwen3.8-flash`，需要切换时
 才单独导出非敏感的 `BAILIAN_BASE_URL` 或 `BAILIAN_MODEL`。
 
 ## 简单版

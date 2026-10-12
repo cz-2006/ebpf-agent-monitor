@@ -18,7 +18,7 @@ def fail(message: str, status: int = 2) -> None:
 def main() -> None:
     api_key = os.environ.get("BAILIAN_API_KEY", "")
     base_url = os.environ.get("BAILIAN_BASE_URL", "").rstrip("/")
-    model = os.environ.get("BAILIAN_MODEL", "qwen3.8-27b")
+    model = os.environ.get("BAILIAN_MODEL", "qwen3.8-flash")
 
     if not api_key:
         fail("BAILIAN_API_KEY is not set")

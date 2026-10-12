@@ -22,7 +22,7 @@ if [[ -z "${BAILIAN_API_KEY:-}" ]]; then
     export BAILIAN_API_KEY
 fi
 BAILIAN_BASE_URL="${BAILIAN_BASE_URL:-https://dashscope.aliyuncs.com/compatible-mode/v1}"
-BAILIAN_MODEL="${BAILIAN_MODEL:-qwen3.8-27b}"
+BAILIAN_MODEL="${BAILIAN_MODEL:-qwen3.8-flash}"
 export BAILIAN_BASE_URL BAILIAN_MODEL
 
 demo_root="$(mktemp -d /tmp/ebpf-agent-monitor-real-demo-full.XXXXXX)" || exit 1

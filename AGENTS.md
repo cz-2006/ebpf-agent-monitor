@@ -173,6 +173,11 @@ HTTPS 明文采集是后期研究方向。OpenSSL 的 SSL_read/SSL_write 仅是�
   BPF maps、Ring Buffer、Collector、CPU 采样、Detector、五类规则和结构化输出；
   README 已增加入口。图中明确排除尚未实现的进阶能力。
 
+- 2026-10-06 新增并扩展 `docs/project-report.md`，按五部分说明总体实现、各项任务、
+  现有确定性/真实 Agent/性能演示的代码与输出、后续改进难度和主要收获。演示部分
+  解释脚本入口、关键代码、PASS 项和原始事件语义；改进部分按低/中/高难度区分工程
+  扩展与研究型进阶任务；README 已增加入口。
+
 - 2026-09-29 用户选择复测实际推荐性能配置。新增
   `experiments/run_recommended_performance.sh`：同时启用 process/file/network，
   FILE_OPEN N=100、quiet-events，默认 15 对，并交替每对的基线/监控执行顺序。
@@ -191,6 +196,21 @@ HTTPS 明文采集是后期研究方向。OpenSSL 的 SSL_read/SSL_write 仅是�
   -3.94%/27.88%；文件、网络、进程阶段分别为 199.76%、374.37%、1.11%。文件与
   网络基线绝对耗时仅约 1.014/1.596 ms。结论是本轮 Agent 风格任务端到端影响较小，
   但约 2 秒等待显著摊薄活跃采集成本，不能据 total 单项宣称达到 5%。
+
+- 2026-10-06 `docs/project-report.md` 已补充“项目目录与文件说明”，逐项解释根目录、
+  正式 C/eBPF 源码、公共头文件、项目文档、早期 bpftrace 实验、正式验证负载、真实
+  Agent 演示、性能脚本及 `build/` 生成文件；同时注明隐藏工具目录和 Python 缓存不
+  属于项目交付源码。报告中的清单已与当前仓库文件逐项核对，无遗漏。
+
+- 2026-10-09 新增根目录 `DEMO_GUIDE.md`，提供不依赖一键 Shell 脚本的双真实 Agent
+  全面演示流程：在终端隐藏输入百炼 API Key、准备敏感读取与工作区外删除夹具、直接
+  运行正式 `build/monitor` 双 Agent 命令、识别进程/文件/网络/审计/告警/生命周期
+  证据、验证删除结果并清理环境。README 已增加入口；文档未写入真实 API Key。
+
+- 2026-10-09 新增根目录 `QUITE_DEMO_GUIDE.md`，保留原版 `DEMO_GUIDE.md` 不变。
+  新版在相同双真实 Agent 场景中启用 `--quiet-events`，隐藏普通进程、文件和网络原始
+  事件，但仍由 Detector 处理事件并展示 Shell 审计、安全告警、注册和退出结果；文档
+  明确 quiet 模式不直接展示 `CONNECT_RESULT`，避免把模型成功响应冒充网络采集证据。
 
 ## 后续协作与记录约定
 
@@ -668,6 +688,19 @@ HTTPS 明文采集是后期研究方向。OpenSSL 的 SSL_read/SSL_write 仅是�
   和本地 model catalog 已同步更新，API Key 与 Base URL 的配置方式不变；旧 Max
   实验记录保留为历史证据。新模型尚待一次最小直连验证。
 
+- 2026-10-09 qwen3.8-27b 额度耗尽，用户决定从剩余额度模型中更换后端。项目默认
+  模型已切换为 qwen3.8-flash；两个百炼启动器、简单/全面真实 Agent 演示脚本、
+  本地 model catalog、README 和两份终端演示说明已同步。API Key 与 Base URL 的
+  配置方式不变。catalog 暂沿用同系列已工作的 Codex 兼容能力字段，新模型仍需用户
+  在实际百炼账户中完成一次最小直连验证，验证前不宣称其 metadata 完全准确。
+
+- 2026-10-09 qwen3.8-flash 已完成一次百炼直连验证：Codex 0.160.1 正确显示
+  model=qwen3.8-flash、provider=bailian、reasoning effort=low，未出现 metadata
+  fallback 警告并成功返回模型文本。模型未严格遵循“只回复 FLASH_OK”，实际回复
+  FLASH_ACTIVE；用户未提供 shell 退出码。该次从项目根目录运行，自动上下文使消耗
+  达到 67,715 tokens，且连续粘贴的 echo/unset 被 Codex 从 stdin 并入用户输入，不能
+  作为低额度基准。后续最小测试应从 /tmp 单独执行调用，等待结束后再输入后续命令。
+
 
 - 百炼真实 Codex Agent 首次受控启动完成了进程侧验证：根 PID 99752 及 Codex
   创建的线程和 lsb_release/getconf 辅助进程全部保持 agent_id=1、
@@ -864,3 +897,9 @@ HTTPS 明文采集是后期研究方向。OpenSSL 的 SSL_read/SSL_write 仅是�
   cgroup=8557/PID=17989，Agent 2 为 cgroup=8576/PID=17990。两次 monitor_exit
   和 DEMO_RESULT 均为 0/PASS；全面版两组网络、Shell audit、安全规则和最终
   cgroup_empty 退出均正确，未见串组。
+
+- 2026-10-12 已为 `include/` 与 `src/` 的全部正式 C/eBPF 代码补充详细教学注释，
+  覆盖共享事件 ABI、字段语义、BPF map 与入口/返回配对、各 hook 的观测边界、
+  Detector 策略和跨事件窗口、cgroup CPU 计算、命令行解析、两阶段受控启动、
+  Ring Buffer 分派、根进程退出与 cgroup 排空、统一清理流程。此次只修改注释，
+  不改变程序行为；`make` 严格构建和 `git diff --check -- include src` 均通过。

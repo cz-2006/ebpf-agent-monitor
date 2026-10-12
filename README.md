@@ -1,10 +1,14 @@
 # eBPF Agent Monitor
 
+课堂现场操作可参考 [双真实 Agent 全面演示说明](DEMO_GUIDE.md)；终端原始事件过多时，
+使用 [低噪声双真实 Agent 全面演示说明](QUITE_DEMO_GUIDE.md)。
+
 项目正在把已验证的 bpftrace 实验迁移为 libbpf + CO-RE 正式原型。
 赛题基础要求的实测证据、缺口与后续验证顺序见
 [验收证据清单](docs/acceptance-status.md)。架构、事件语义、策略设计、验证结果和
 扩展边界集中说明于[系统设计与实现说明](docs/design.md)。
 需要快速查看系统各模块及数据流时，请打开[项目整体架构图](docs/architecture-diagram.md)。
+项目的总体实现、各项任务实现方法、实验结果和限制见[项目报告](docs/project-report.md)。
 
 ## 当前正式原型
 
@@ -582,7 +586,7 @@ quiet-events，默认完成 15 对交替顺序样本：
 ## 使用阿里云百炼 Qwen 运行真实 Codex Agent
 
 experiments/run_bailian_codex.sh 使用 Codex CLI 作为本地 Agent harness，
-将模型请求发往百炼 Responses API。脚本当前默认模型为 qwen3.8-27b，
+将模型请求发往百炼 Responses API。脚本当前默认模型为 qwen3.8-flash，
 不读取普通 ~/.codex/config.toml，不持久化会话，也不在仓库中保存 API Key。
 
 先从百炼控制台复制当前业务空间的 API Host，然后在终端中安全读入密钥：

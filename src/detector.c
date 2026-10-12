@@ -15,10 +15,15 @@
 
 void detector_init(struct detector *detector)
 {
+    /* Detector 不拥有外部资源，清零即可得到可用的初始状态。 */
     memset(detector, 0, sizeof(*detector));
 }
 
-/* 策略目录统一保存为绝对路径且以 / 结尾，便于做路径边界匹配。 */
+/*
+ * 策略目录统一保存为绝对路径，并去掉重复的末尾斜杠后保留一个目录边界
+ * 斜杠。例如 /tmp/secret/// 变为 /tmp/secret/。这里只规范策略字符串，
+ * 不访问文件系统，因此目录可以在配置之后才创建。
+ */
 static int normalize_policy_dir(char *destination, size_t size,
                                 const char *source)
 {
@@ -56,6 +61,7 @@ int detector_add_agent(struct detector *detector, __u32 agent_id,
         runtime_path_count > DETECTOR_MAX_RUNTIME_DIRS)
         return -1;
 
+    /* parse_agents 已检查 ID 唯一；此处把命令行配置复制为检测期稳定状态。 */
     policy = &detector->policies[detector->policy_count];
     policy->agent_id = agent_id;
     policy->shell_policy = shell_policy;
@@ -122,6 +128,7 @@ static int path_in_directory(const char *path, const char *directory)
     directory_length = strlen(directory);
     if (directory_length == 1)
         return path[0] == '/';
+    /* directory 末尾含 /，所以 /tmp/a 不会错误匹配 /tmp/abc。 */
     if (!strncmp(path, directory, directory_length))
         return 1;
 
@@ -130,7 +137,10 @@ static int path_in_directory(const char *path, const char *directory)
            !strncmp(path, directory, directory_length - 1);
 }
 
-/* Shell 策略支持 disabled/allow/audit/deny，便于真实 Agent 降噪。 */
+/*
+ * Shell 策略支持 disabled/allow/audit/deny。判断依据是 EXEC_ATTEMPT 的目标
+ * basename；deny 当前只输出 high 告警，并不会拒绝 execve。
+ */
 static void detect_unexpected_shell(
     const struct detector_agent_policy *policy,
     const struct exec_event *event)
@@ -166,7 +176,10 @@ static void detect_unexpected_shell(
     fflush(stdout);
 }
 
-/* 只把敏感目录中的可读打开视为读取证据，排除纯写和目录遍历。 */
+/*
+ * 只把敏感目录中的可读打开视为读取证据。O_ACCMODE 从 flags 低两位提取
+ * O_RDONLY/O_WRONLY/O_RDWR；纯写和 O_DIRECTORY 目录遍历不算敏感内容读取。
+ */
 static void detect_sensitive_file_access(
     const struct detector_agent_policy *policy,
     const struct file_open_event *event)
@@ -190,7 +203,10 @@ static void detect_sensitive_file_access(
     fflush(stdout);
 }
 
-/* 区分业务工作区外删除和 Codex/bwrap 自身运行时清理。 */
+/*
+ * 删除规则分三层：工作区内静默；显式 runtime 目录内输出活动证据；其余
+ * 工作区外路径输出 high 告警。输入来自删除前的 LSM hook，因此语义是尝试。
+ */
 static void detect_outside_workspace_delete(
     const struct detector_agent_policy *policy,
     const struct file_unlink_event *event)
@@ -206,6 +222,7 @@ static void detect_outside_workspace_delete(
         return;
 
     directory_length = strnlen(event->payload.dir_path, EVENT_FILENAME_LEN);
+    /* dir_path 和 name 分别来自可信内核对象，先有界拼成规则使用的目标。 */
     written = snprintf(target, sizeof(target), "%.*s%s%.*s",
                        EVENT_FILENAME_LEN, event->payload.dir_path,
                        directory_length &&
@@ -241,7 +258,10 @@ static void detect_outside_workspace_delete(
     fflush(stdout);
 }
 
-/* 词法消解 . 和 ..；不访问文件系统，也不把结果冒充 realpath。 */
+/*
+ * 词法消解多余 /、. 和 ..，不访问文件系统，也不解析符号链接。它只是把
+ * syscall 尝试字符串变得可比较，不能称为内核解析后的真实路径。
+ */
 static int normalize_absolute_path(const char *input, char *output,
                                    size_t output_size)
 {
@@ -314,6 +334,7 @@ static int reconstruct_attempted_path(const struct file_open_result_event *event
                                        output, output_size);
     }
 
+    /* 相对路径必须在进程仍存在时借助 /proc 取得 cwd 或 dirfd 指向。 */
     if (event->payload.dirfd == AT_FDCWD) {
         written = snprintf(proc_path, sizeof(proc_path), "/proc/%u/cwd",
                            event->header.pid);
@@ -337,7 +358,10 @@ static int reconstruct_attempted_path(const struct file_open_result_event *event
     return normalize_absolute_path(combined, output, output_size);
 }
 
-/* 为 (agent_id, target) 找到现有窗口，或复用最旧槽位。 */
+/*
+ * 为 (agent_id, target) 找到现有窗口。不同 Agent 即使访问相同路径也不会
+ * 合并计数；固定表已满时复用 last_seen_ns 最早的槽位，以限制内存上限。
+ */
 static struct failed_open_state *
 failed_open_state(struct detector *detector, __u32 agent_id,
                   const char *path, __u64 timestamp_ns)
@@ -376,7 +400,10 @@ failed_open_state(struct detector *detector, __u32 agent_id,
     return free_state;
 }
 
-/* 同 Agent、同目标、时间窗内达到阈值时只产生一次活动告警。 */
+/*
+ * 只统计 ENOENT：同 Agent、同目标、同时间窗口内每次都输出活动证据，达到
+ * 阈值时额外输出一次 medium 安全告警，并保存状态供 CPU 样本联合判断。
+ */
 static void detect_repeated_failed_open(
     struct detector *detector,
     const struct detector_agent_policy *policy,
@@ -402,6 +429,7 @@ static void detect_repeated_failed_open(
 
     window_ns = (__u64)policy->failed_open_window_ms * 1000000ULL;
     elapsed_ns = header->timestamp_ns - state->window_start_ns;
+    /* 超出窗口便从当前事件重新计数，旧窗口的告警抑制标志同时清除。 */
     if (elapsed_ns > window_ns) {
         state->count = 0;
         state->alerted = 0;
@@ -471,6 +499,7 @@ void detector_process_cpu_sample(
            (uint64_t)(sample->cpu_percent_x100 / 100),
            (uint64_t)(sample->cpu_percent_x100 % 100));
 
+    /* 资源样本始终可观察；低于门槛时不进入跨事件联合匹配。 */
     if (sample->cpu_percent_x100 <
         (__u64)policy->cpu_threshold_percent * 100ULL) {
         fflush(stdout);
@@ -482,6 +511,7 @@ void detector_process_cpu_sample(
             &detector->failed_open_states[index];
         __u64 window_ns;
 
+        /* 必须是同 Agent、同 cgroup、窗口未过期且重复失败已达阈值。 */
         if (!state->used || !state->alerted || state->joint_alerted ||
             state->agent_id != sample->agent_id ||
             state->cgroup_id != sample->cgroup_id ||
@@ -512,7 +542,10 @@ void detector_process_cpu_sample(
     fflush(stdout);
 }
 
-/* 按事件类型分派；无关事件不会改变检测器状态。 */
+/*
+ * Collector 已做第一层协议校验，这里再次检查公共头并按事件类型核对精确
+ * 结构大小。进程 fork/exit 和网络事件当前没有规则，因此不会改变状态。
+ */
 void detector_process(struct detector *detector, const void *data,
                       size_t size)
 {

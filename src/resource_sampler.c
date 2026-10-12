@@ -11,6 +11,10 @@
  * 为 100% 计算，因此多线程 Agent 在多核机器上理论上可能超过 100%。
  */
 
+/*
+ * 使用单调时钟而非现实时间，避免系统校时导致区间突然倒退或跳跃。
+ * 返回 0 表示成功，-1 时保留 clock_gettime 设置的 errno。
+ */
 static int monotonic_ns(__u64 *timestamp_ns)
 {
     struct timespec now;
@@ -21,6 +25,10 @@ static int monotonic_ns(__u64 *timestamp_ns)
     return 0;
 }
 
+/*
+ * cpu.stat 是“键 值”文本文件。本函数只提取自 cgroup 创建以来累计消耗的
+ * usage_usec；它包含该 cgroup 中所有线程和后代的 CPU 时间。
+ */
 static int read_usage_usec(const char *path, __u64 *usage_usec)
 {
     char key[64];
@@ -43,9 +51,14 @@ static int read_usage_usec(const char *path, __u64 *usage_usec)
 
 void resource_sampler_init(struct resource_sampler *sampler)
 {
+    /* 固定数组清零后 count=0、所有槽位 inactive。 */
     memset(sampler, 0, sizeof(*sampler));
 }
 
+/*
+ * 注册采样对象时立即读取一次时间和 usage_usec 作为基线，因此第一次回调
+ * 报告的是注册后一个完整区间的增量，而不是 cgroup 历史累计值。
+ */
 int resource_sampler_add_agent(struct resource_sampler *sampler,
                                __u32 agent_id, __u64 cgroup_id,
                                const char *cgroup_path, __u32 interval_ms)
@@ -74,7 +87,10 @@ int resource_sampler_add_agent(struct resource_sampler *sampler,
     return 0;
 }
 
-/* 第一次读取只建立基线；后续样本用 CPU 增量/墙钟增量计算利用率。 */
+/*
+ * 计算式：usage_delta_usec / interval_usec * 100%。代码保存百分比乘 100，
+ * 因而乘数是 10000。force 用于 cgroup 排空时忽略 next_sample_ns 做末次采样。
+ */
 static void collect(struct resource_sampler_agent *agent, int force,
                     resource_sample_callback callback, void *context)
 {
@@ -95,6 +111,7 @@ static void collect(struct resource_sampler_agent *agent, int force,
                                 (__u64)agent->interval_ms * 1000000ULL;
         return;
     }
+    /* 时钟或计数异常时不产生虚假样本，只重建下一轮基线。 */
     if (timestamp_ns <= agent->previous_timestamp_ns ||
         usage_usec < agent->previous_usage_usec)
         goto update_baseline;
@@ -126,6 +143,7 @@ void resource_sampler_collect_due(struct resource_sampler *sampler,
 
     if (!sampler || !callback)
         return;
+    /* 每个 Agent 有独立截止时间，主循环可以统一高频调用本函数。 */
     for (index = 0; index < sampler->count; index++)
         collect(&sampler->agents[index], 0, callback, context);
 }
@@ -141,6 +159,7 @@ void resource_sampler_collect_agent(struct resource_sampler *sampler,
         return;
     for (index = 0; index < sampler->count; index++) {
         if (sampler->agents[index].agent_id == agent_id) {
+            /* 强制末次采样后停用，防止已删除 cgroup 被再次读取。 */
             collect(&sampler->agents[index], 1, callback, context);
             sampler->agents[index].active = 0;
             return;
